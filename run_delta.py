@@ -203,7 +203,7 @@ async def AsyncModbusCheckReadRegisters(acuClass, readAddress=27136):
     client = AsyncModbusSerialClient(method='rtu', port=acuClass.COM, baudrate=acuClass.BR, parity='N',
                                      stopbits=1, bytesize=8, timeout=1, framer=ModbusRtuFramer)
     await client.connect()
-    await asyncio.sleep(1)
+    await asyncio.sleep(2)
     RR = await asyncReadRegisters(client, readAddress, 1)
 
     try:
@@ -912,6 +912,10 @@ async def EnergyMemoryRetention(acuClass, WaitControl):
         logger.error('{} Energy memory retention test 1 has failed {}'.format(acuClass.serialNum, Energy))
 
     await acuClass.plug.powerCycleSuperSlow()
+    
+    # add wait time reduce the posibility of reading failed
+    await asyncio.sleep(40)
+    
     Energy = await checkEnergyLegacy(acuClass)
     try:
         assert Energy == [3167, 20, 2134, 0, 2052, 0, 5787, 1, 5302, 20, 1033, 20, 1286, 2, 6553, 2,

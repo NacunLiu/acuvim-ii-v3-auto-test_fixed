@@ -329,14 +329,16 @@ async def AsyncManualEnergyWriteLegacy(acuClass):
 
 async def asyncDHCPEnablePowerCycle(acuClass):
     await asyncConnectWrite(acuClass, 258, [1], '{} DHCP enabled'.format(acuClass.serialNum))  # Enabled DHCP
-    await acuClass.plug.powerCycleSlow()
+    await safe_power_cycle(acuClass, retries=5, delay=30)
+    # await acuClass.plug.powerCycleSlow()
     await asyncConnectIp(acuClass)
 
 
 # Purpose: Enable DHCP
 async def asyncDHCPEnable(acuClass):
     await asyncConnectWrite(acuClass, 258, [1], '{} DHCP enabled'.format(acuClass.serialNum))  # Enabled DHCP
-    await acuClass.plug.powerCycleSlow()
+    await safe_power_cycle(acuClass, retries=5, delay=30)
+    
     await asyncConnectIp(acuClass)
     # REQUIRE POWERCYCLE
 
@@ -516,7 +518,7 @@ def meterModelScan(acuClass) -> str:
     MeterFamily = defaultdict(list)
     MeterFamily['A'] = ['CU0', 'CP0', 'CP2', 'CP4', 'CU2']  # Accuenergy model
     MeterFamily['E'] = ['CRD', 'CPG', 'CXD', 'CPD', 'CUG', 'CUD', 'CPE', 'CPH']  # Eaton model
-    MeterFamily['D'] = ['CPB', 'CUB']
+    MeterFamily['D'] = ['CPB', 'CUB'] # DEIF model
     client = ModbusSerialClient(method='rtu', port=acuClass.COM, baudrate=acuClass.BR, parity='N',
                                 stopbits=1, bytesize=8, timeout=1, unit=1)
     client.connect()
@@ -890,7 +892,22 @@ async def AsyncReadModelType(Baudrate, COM):
     client.close()
     return RR.registers[-1]
 
-
+# safe power cycle will call the plug to reboot meter, this function will make sure to capture ERROR when the wifi is down
+# retry as desginated times then indicating to manually reboot to continue 
+async def safe_power_cycle(acuClass, retries=3, delay=30):
+        for attempt in range(1, retries + 1):
+          try:
+              await acuClass.plug.powerCycleSuperSlow()
+              logger.info(f"Power cycle succeeded on attempt {attempt}")
+              return
+          except Exception as e:
+              logger.warning(f"Power cycle attempt {attempt} failed: {e}")
+              if attempt < retries:
+                  logger.info(f"Retrying after {delay} seconds...")
+                  await asyncio.sleep(delay)
+              else:
+                  logger.error("Power cycle failed after all retries, continuing test without abort. Please manually reboot meter in 30 seconds")
+                  await asyncio.sleep(90)
 # Energy memory retention test
 # Purpose: 
 async def EnergyMemoryRetention(acuClass, WaitControl):
@@ -912,8 +929,10 @@ async def EnergyMemoryRetention(acuClass, WaitControl):
         acuClass.failCount += 1
         acuClass.failTest.append('\nEnergy memory retention test 1 fails')
         logger.error('{} Energy memory retention test 1 has failed {}'.format(acuClass.serialNum, Energy))
+        
 
-    await acuClass.plug.powerCycleSuperSlow()
+    await safe_power_cycle(acuClass, retries=5, delay=30)
+    await asyncio.sleep(30)
     Energy = await checkEnergyLegacy(acuClass)
     try:
         assert Energy == [20, 31679, 0, 21347, 0, 20528, 1, 57872, 20, 53026, 20, 10332, 2, \
