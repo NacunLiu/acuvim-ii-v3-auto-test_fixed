@@ -516,7 +516,7 @@ async def meterMountTypeScan(acuClass):
 # This function will read the meter model, will return a leter to indicate meter type
 def meterModelScan(acuClass) -> str:
     MeterFamily = defaultdict(list)
-    MeterFamily['A'] = ['CU0', 'CP0', 'CP2', 'CP4', 'CU2']  # Accuenergy model
+    MeterFamily['A'] = ['CU0', 'CP0', 'CP2', 'CP4', 'CU2', 'CV0', 'CM0']  # Accuenergy model
     MeterFamily['E'] = ['CRD', 'CPG', 'CXD', 'CPD', 'CUG', 'CUD', 'CPE', 'CPH']  # Eaton model
     MeterFamily['D'] = ['CPB', 'CUB'] # DEIF model
     client = ModbusSerialClient(method='rtu', port=acuClass.COM, baudrate=acuClass.BR, parity='N',

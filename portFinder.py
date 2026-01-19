@@ -8,7 +8,7 @@ def serial_ports():
         :returns:
             A list of the serial ports available on the system
     """
-    ports = ['COM%s' % (i + 1) for i in range(30)]
+    ports = ['COM%s' % (i + 1) for i in range(10)]
     result = []
     for port in ports:
         try:
@@ -21,3 +21,5 @@ def serial_ports():
 
 if __name__ == '__main__':
     print(serial_ports())
+        
+                

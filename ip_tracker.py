@@ -1,105 +1,129 @@
+"""ip_tracker.py
 
-"""
-This function will scan all Ips from router, return the target ip matched by Mac Address
+Resolve Kasa smart-plug IPs by scanning the local subnet and matching MAC addresses.
 
-Returns:
-    Ip address (string)
+Compatibility note
+------------------
+This module exposes BOTH:
+  - `get_target_ip_map()`  (recommended)
+  - `targetIp`             (legacy global used by older modules)
+
+If scanning fails, it returns an empty dict rather than throwing, so the rest of
+the program can still start and print a helpful message.
 """
-import subprocess
+
+from __future__ import annotations
+
+import os
 import re
-from collections import defaultdict
-netDict = defaultdict(str)
-plugDict = defaultdict(str)
-target_mac1 = "78:8C:B5:B5:15:9C"
-target_mac2 = "78:8C:B5:B5:07:58"
-target_mac3 = "9C:A2:F4:95:3E:27"
-target_mac4 = "9C:A2:F4:95:3D:55"
-target_mac5 = "9C:A2:F4:95:3E:47"
+import subprocess
+from typing import Dict, Tuple
 
-ip_range1 = "172.27.27.100-110"
-ip_range2 = "172.27.24.1-204"
-ip_range3 = "172.27.26.20-30"
-ip_range4 = "172.27.26.40-60"
-ip_range5 = "172.27.27.200-230"
 
-netDict[target_mac1] = ip_range1
-netDict[target_mac2] = ip_range2
-netDict[target_mac3] = ip_range3
-netDict[target_mac4] = ip_range4
-netDict[target_mac5] = ip_range5
+# =========================
+# User-configurable section
+# =========================
 
-plugDict[target_mac1] = 1
-plugDict[target_mac2] = 2
-plugDict[target_mac3] = 3
-plugDict[target_mac4] = 4
-plugDict[target_mac5] = 5
+# MAC -> plug id
+# Keep MACs uppercase with ':' separators.
+TARGET_MACS: Dict[str, int] = {
+    # Example from your environment
+    "78:8C:B5:B5:15:9C": 1,
+    "78:8C:B5:B5:07:58": 2,
+    # Add more here if needed
+    # "9C:A2:F4:95:3E:27": 3,
+    # "9C:A2:F4:95:3D:55": 4,
+    # "9C:A2:F4:95:3E:47": 5,
+}
 
-def get_ip_address(target_mac):
+# Your mask is 255.255.255.0, so /24 is the standard CIDR.
+SUBNET = os.environ.get("ACU_PLUG_SUBNET", "192.168.61.0/24")
+
+
+# =========================
+# Implementation
+# =========================
+
+_CACHE: Dict[int, Tuple[str, str]] | None = None
+
+
+def _run_nmap_ping_scan(subnet: str, timeout_s: int = 30) -> str:
+    """Run `nmap -sn` and return stdout text.
+
+    Notes on Windows:
+    - If nmap isn't in PATH, this will fail.
+    - If you run without admin rights, sometimes MACs won't appear.
+    """
+    # -sn: ping scan (no port scan)
+    return subprocess.check_output(
+        ["nmap", "-sn", subnet],
+        universal_newlines=True,
+        errors="ignore",
+        timeout=timeout_s,
+    )
+
+
+def scan_subnet_for_macs(subnet: str, timeout_s: int = 30) -> Dict[str, str]:
+    """Scan subnet and return mapping: MAC (UPPER) -> IP."""
     try:
-        output = subprocess.check_output(["arp", "-a"], universal_newlines=True)
-        lines = output.splitlines()
+        out = _run_nmap_ping_scan(subnet, timeout_s=timeout_s)
+    except Exception:
+        return {}
 
-        for line in lines:
-            match = re.search(r"([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\s+([0-9A-Fa-f-]+)", line)
-            if match:
-                ip_address = match.group(1)
-                mac_address = match.group(2).replace("-", ":").upper()
-                if mac_address == target_mac:
-                    return ip_address
-        return None
-    except subprocess.CalledProcessError:
-        return None
-    
-# targetIp = get_ip_address(target_mac1) #Method abolished due to lack of consistency, target ip has to in the arp cache in order to be extracted
+    ip_for_mac: Dict[str, str] = {}
+    current_ip: str | None = None
 
-def nmap_scan(targetMAC):
-    try:
-        subprocess.check_output(["nmap", "-sn",netDict[targetMAC],"-oN","scan_results.txt"], universal_newlines=True)
-        return macQuery(targetMAC)
-    except subprocess.CalledProcessError as e:
-        print('ERROR {}'.format(e))
-        return None
-    
-def macQuery(targetMAC):
-    if(not targetMAC):
-        print('Fail to load target MAC Address')
-        return
-    with open('scan_results.txt','r') as file:
-        next(file)
-        scan_output = file.read()
-        
-    # Regular expression patterns to match IP addresses and MAC addresses
-    ip_pattern = r'(\d+\.\d+\.\d+\.\d+)'
-    mac_pattern = r'[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}'
-    ip_addresses = re.findall(ip_pattern, scan_output)
-    mac_addresses = re.findall(mac_pattern, scan_output)
+    for line in out.splitlines():
+        m_ip = re.search(r"Nmap scan report for\s+(\d+\.\d+\.\d+\.\d+)", line)
+        if m_ip:
+            current_ip = m_ip.group(1)
+            continue
 
-    # Create a dictionary to store IP-MAC pairs
-    ip_mac_mapping = {}
-    for ip, mac in zip(ip_addresses, mac_addresses):
-        ip_mac_mapping[mac] = ip
+        m_mac = re.search(
+            r"MAC Address:\s*([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})",
+            line,
+        )
+        if m_mac and current_ip:
+            mac = m_mac.group(1).upper()
+            ip_for_mac[mac] = current_ip
 
-    # Example: Match an IP address with its MAC address
-    mac_to_match = targetMAC
-    if mac_to_match in ip_mac_mapping:
-        #print(f"MAC: {mac_to_match}, Ip: {ip_mac_mapping[mac_to_match]}")
-        return ip_mac_mapping[mac_to_match]
-    else:
-        return None
-    
-#targetIp = get_ip_address(target_mac1) #Method abolished due to lack of consistency   
-targetList = []
-targetList.append(tuple((target_mac1,nmap_scan(target_mac1))))
-targetList.append(tuple((target_mac2,nmap_scan(target_mac2))))
-targetList.append(tuple((target_mac3,nmap_scan(target_mac3))))
-targetList.append(tuple((target_mac4,nmap_scan(target_mac4))))
-targetList.append(tuple((target_mac5,nmap_scan(target_mac5))))
+    return ip_for_mac
 
-targetIp = defaultdict(tuple)
-for c,ip in enumerate(targetList):
-    if(ip[1]!=None):
-        targetIp[c+1]=tuple((ip[0],ip[1])) # MAC, IP
 
-if __name__ == '__main__':
-    for plugTuple in targetIp.keys():
-        print('Plug {} MAC {} ip {}'.format(plugTuple,targetIp[plugTuple][0],targetIp[plugTuple][1]))
+def get_target_ip_map(force_refresh: bool = False) -> Dict[int, Tuple[str, str]]:
+    """Resolve plug IPs once and return:
+
+    Returns:
+        Dict[int, Tuple[str, str]]: {plug_id: (mac, ip), ...}
+    """
+    global _CACHE
+    if _CACHE is not None and not force_refresh:
+        return _CACHE
+
+    mapping = scan_subnet_for_macs(SUBNET)
+    result: Dict[int, Tuple[str, str]] = {}
+
+    for mac, plug_no in TARGET_MACS.items():
+        ip = mapping.get(mac.upper())
+        if ip:
+            result[plug_no] = (mac.upper(), ip)
+
+    _CACHE = result
+    return result
+
+
+# Legacy global for backward compatibility
+try:
+    targetIp: Dict[int, Tuple[str, str]] = get_target_ip_map()
+except Exception:
+    targetIp = {}
+
+
+if __name__ == "__main__":
+    targetIp = get_target_ip_map(force_refresh=True)
+    print("targetIp:", targetIp)
+    if not targetIp:
+        print(
+            "No plug found by MAC on this subnet. Possible reasons: "
+            "Wi-Fi client isolation / no MAC in nmap output / nmap not in PATH / need Admin."
+        )

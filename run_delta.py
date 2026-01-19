@@ -914,7 +914,7 @@ async def EnergyMemoryRetention(acuClass, WaitControl):
     await acuClass.plug.powerCycleSuperSlow()
     
     # add wait time reduce the posibility of reading failed
-    await asyncio.sleep(40)
+    await asyncio.sleep(100)
     
     Energy = await checkEnergyLegacy(acuClass)
     try:
