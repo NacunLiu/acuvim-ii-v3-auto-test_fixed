@@ -13,7 +13,7 @@ ALL Changes to plug subject are using awaitable methods (Async), you must await 
 """
 import kasa
 import asyncio
-from ip_tracker import targetIp
+from acuvim_test.hardware.ip_tracker import get_target_ip_map
 import time
 
 
@@ -26,6 +26,18 @@ class KasaSmartPlug():
     def loading_animation(self, duration):
         time.sleep(duration)
         return
+
+    async def cycle(self):
+        """Pure power toggle: off, brief pause, on. No store/boot waits.
+
+        All FeRAM-store and boot waits are owned by run.reboot_meter so the
+        timing lives in one place and switch/manual modes stay consistent.
+        """
+        await self.dev.update()
+        print('Power cycling plug {} >>>>'.format(self.Ip))
+        await self.dev.turn_off()
+        await asyncio.sleep(3)
+        await self.dev.turn_on()
 
     async def powerCycle(self, time=20):
         await self.dev.update()
@@ -94,9 +106,9 @@ class KasaSmartPlug():
 
 
 if __name__ == '__main__':
-    PlugIp = targetIp
+    PlugIp = get_target_ip_map()
     for ip in PlugIp:
-        plug = KasaSmartPlug(targetIp[ip][1])
+        plug = KasaSmartPlug(PlugIp[ip][1])
         asyncio.run(plug.powerCycle())
 
     # plug = KasaSmartPlug(PlugIp[0])

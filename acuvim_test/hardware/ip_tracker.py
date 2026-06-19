@@ -24,8 +24,16 @@ from typing import Dict, Tuple
 # User-configurable section
 # =========================
 
-# MAC -> plug id
-# Keep MACs uppercase with ':' separators.
+# PREFERRED: directly map plug id -> IP address. When this is non-empty, the
+# nmap/MAC scan is skipped entirely (no nmap needed, works even if WiFi blocks
+# discovery). Get each plug's IP from the Kasa app (Device Info) or your router.
+PLUG_IPS: Dict[int, str] = {
+    # 1: "172.27.24.50",
+    # 2: "172.27.24.51",
+}
+
+# FALLBACK (used only when PLUG_IPS is empty): discover plugs by MAC via nmap.
+# MAC -> plug id. Keep MACs uppercase with ':' separators.
 TARGET_MACS: Dict[str, int] = {
     # Example from your environment
     "78:8C:B5:B5:15:9C": 1,
@@ -36,7 +44,7 @@ TARGET_MACS: Dict[str, int] = {
     # "9C:A2:F4:95:3E:47": 5,
 }
 
-# Your mask is 255.255.255.0, so /24 is the standard CIDR.
+# Subnet to scan (fallback path only). Override via ACU_PLUG_SUBNET env var.
 SUBNET = os.environ.get("ACU_PLUG_SUBNET", "192.168.61.0/24")
 
 
@@ -100,6 +108,12 @@ def get_target_ip_map(force_refresh: bool = False) -> Dict[int, Tuple[str, str]]
     if _CACHE is not None and not force_refresh:
         return _CACHE
 
+    # Preferred path: directly-configured IPs, no scan needed.
+    if PLUG_IPS:
+        _CACHE = {plug_no: ("manual", ip) for plug_no, ip in PLUG_IPS.items()}
+        return _CACHE
+
+    # Fallback: discover by MAC via nmap subnet scan.
     mapping = scan_subnet_for_macs(SUBNET)
     result: Dict[int, Tuple[str, str]] = {}
 
@@ -112,11 +126,12 @@ def get_target_ip_map(force_refresh: bool = False) -> Dict[int, Tuple[str, str]]
     return result
 
 
-# Legacy global for backward compatibility
-try:
-    targetIp: Dict[int, Tuple[str, str]] = get_target_ip_map()
-except Exception:
-    targetIp = {}
+# Legacy global for backward compatibility.
+# NOTE: this is intentionally NOT populated by a scan at import time. Scanning
+# the subnet with nmap is slow and is pointless in manual-reboot mode, so the
+# scan is deferred to callers via get_target_ip_map(). Switch mode calls that
+# explicitly; manual mode never touches the network.
+targetIp: Dict[int, Tuple[str, str]] = {}
 
 
 if __name__ == "__main__":

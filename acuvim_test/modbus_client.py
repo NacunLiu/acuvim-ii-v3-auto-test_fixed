@@ -1,0 +1,183 @@
+"""Low-level Modbus access layer: client factories and register read/write."""
+import asyncio
+from time import sleep
+
+from pymodbus.client import ModbusSerialClient, AsyncModbusSerialClient
+from pymodbus.transaction import ModbusRtuFramer
+from pymodbus.payload import BinaryPayloadBuilder
+from pymodbus.constants import Endian
+
+from acuvim_test import registers as reg
+from acuvim_test.log import logger
+
+
+# ---- Modbus client factories -------------------------------------------------
+# Single source of truth for the meter's RS485 line settings. If the pymodbus
+# API changes (e.g. a 3.13 migration), update only these two functions.
+def make_serial_client(port, baudrate):
+    """Sync Modbus-RTU client with the project's standard line settings."""
+    return ModbusSerialClient(method='rtu', port=port, baudrate=baudrate, parity='N',
+                              stopbits=1, bytesize=8, timeout=1, framer=ModbusRtuFramer)
+
+
+def make_async_serial_client(port, baudrate):
+    """Async Modbus-RTU client with the project's standard line settings."""
+    return AsyncModbusSerialClient(method='rtu', port=port, baudrate=baudrate, parity='N',
+                                   stopbits=1, bytesize=8, timeout=1, framer=ModbusRtuFramer)
+
+
+async def connect_with_retry(client, port, attempts=3, delay=2):
+    """Open `client`, retrying if the COM port is briefly unavailable.
+
+    On Windows the OS may not have released the serial handle yet from a prior
+    close(), so a fresh connect() can fail with 'Access is denied' or just leave
+    client.connected False. We retry with a short delay. Returns True if the
+    connection is actually up.
+    """
+    for i in range(1, attempts + 1):
+        try:
+            await client.connect()
+        except Exception as e:
+            logger.warning('connect {} attempt {}/{} raised: {}'.format(port, i, attempts, e))
+        await asyncio.sleep(1)
+        if client.connected:
+            return True
+        logger.warning('{} not ready (attempt {}/{}), retrying...'.format(port, i, attempts))
+        await asyncio.sleep(delay)
+    logger.error('Could not open {} after {} attempts'.format(port, attempts))
+    return False
+
+
+###########################################
+# Purpose:
+# synchronous connect and write through modbus rtu, allow changing protocol 1 from Modbus to Bacnet; NO NEED TO REBOOT
+def syncConnectWrite(old_baudrate, Port, Address, Value, promptEnable: bool = False):
+    client = make_serial_client(Port, old_baudrate)
+    client.connect()
+    sleep(1)
+    if (promptEnable):
+        logger.info('Sync Connection Status: {}'.format(client.connected))
+    SyncModbusWriteRegisters(client, Address, Value)
+    client.close()
+    sleep(2)
+
+
+############################################
+# Purpose:
+# synchronous write to target register
+# inputs: ModbusSerialClient, destination address, and list of values
+def SyncModbusWriteRegisters(client, Address, Value):
+    # write_registers(address: int, values: List[int] | int, slave: int = 0, **kwargs: Any) ModbusResponse #0x10
+    builder = BinaryPayloadBuilder(byteorder=Endian.Big)
+    for value in Value:
+        assert (value <= 65535 and value >= 0), "Input overflow~"
+        builder.add_16bit_uint(value)
+    client.write_registers(Address, builder.to_registers(), slave=1)
+
+
+##########################################
+async def asyncReadRegisters(client, Address: int, Size: int, Slave: int = 1):
+    rr = await client.read_holding_registers(address=Address, count=Size, slave=Slave)
+    await asyncio.sleep(2)
+    return rr
+
+
+# Check if the custom register has default value of 0
+async def AsyncModbusCheckReadRegisters(acuClass, readAddress=reg.CUSTOM_REG_DEFAULT):
+    client = make_async_serial_client(acuClass.COM, acuClass.BR)
+    await client.connect()
+    await asyncio.sleep(1)
+    RR = await asyncReadRegisters(client, readAddress, 1)
+
+    try:
+        assert len(RR.registers) == 1
+
+    except AssertionError as e:
+        logger.warning(e)
+        acuClass.failCount += 1
+        acuClass.failTest.append(e)
+    client.close()
+
+    if (readAddress != reg.CUSTOM_REG_DEFAULT):
+        return RR.registers[-1]
+
+
+##########################################
+# Purpose: Async Connect and write to MULTIPLE registers
+# recommended asynchronous connect and write through modbus rtu
+async def asyncConnectWriteMultipleRegisters(acuClass, Address: list, \
+                                             Value: list, prompt: str = None):
+    if (prompt):
+        logger.info(prompt)
+
+    client = make_async_serial_client(acuClass.COM, acuClass.BR)
+    try:
+        if not await connect_with_retry(client, acuClass.COM):
+            raise ConnectionError('could not open {}'.format(acuClass.COM))
+        logger.info('RTU Connection Status: {}'.format(client.connected))
+        for index, address in enumerate(Address):
+            builder = BinaryPayloadBuilder(byteorder=Endian.Big)
+            localAddress = address
+            for node in Value[index]:
+                logger.info('writing {} to {}'.format(node, localAddress))
+                localAddress += 1
+                builder.add_16bit_uint(node)
+            await client.write_registers(address, builder.to_registers(), slave=1)
+            await asyncio.sleep(1)
+
+    except Exception as e:
+        logger.warning('Unable to write {}'.format(e))
+        acuClass.fail('asyncConnectWrite function failed address: {}'.format(Address))
+    client.close()
+    await asyncio.sleep(2)
+    return
+
+
+##########################################
+# Purpose: Async Connect and write to register
+# recommended asynchronous connect and write through modbus rtu
+async def asyncConnectWrite(acuClass, Address: int, \
+                            Value: list, prompt: str = None):
+    if (prompt):
+        logger.info(prompt)
+    client = make_async_serial_client(acuClass.COM, acuClass.BR)
+    try:
+        if not await connect_with_retry(client, acuClass.COM):
+            raise ConnectionError('could not open {}'.format(acuClass.COM))
+        logger.debug('RTU Connection Status: {}'.format(client.connected))
+        address = Address
+        builder = BinaryPayloadBuilder(byteorder=Endian.Big)
+        for value in Value:
+            value = int(value)
+            logger.debug('writing {} to {}'.format(value, address))
+            address += 1
+            builder.add_16bit_uint(value)
+        await client.write_registers(Address, builder.to_registers(), slave=1)
+        await asyncio.sleep(1)
+
+    except Exception as e:
+        logger.warning('Unable to write {}'.format(e))
+        acuClass.fail('asyncConnectWrite function failed address: {}'.format(Address))
+    client.close()
+    await asyncio.sleep(2)
+
+
+# return the serial number string
+async def AsyncReadSerialId(acuClass, slaveId):
+    client = make_async_serial_client(acuClass.COM, acuClass.BR)
+    await client.connect()
+    await asyncio.sleep(1)
+    try:
+        SR = await client.read_holding_registers(reg.SERIAL_NUMBER, 6, slaveId)
+        SerialNumber = ''
+        for reading in SR.registers:
+            ascii_hex = format(int(reading), '02X')
+
+            hex_bytes = bytes.fromhex(ascii_hex)
+            SerialNumber += hex_bytes.decode('ascii')
+            client.close()
+        return SerialNumber[:-1]
+    except Exception:
+        acuClass.fail(acuClass.serialNum)
+        client.close()
+        return ''

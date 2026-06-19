@@ -8,7 +8,7 @@ def serial_ports():
         :returns:
             A list of the serial ports available on the system
     """
-    ports = ['COM%s' % (i + 1) for i in range(10)]
+    ports = ['COM%s' % (i + 1) for i in range(20)]
     result = []
     for port in ports:
         try:
@@ -18,6 +18,20 @@ def serial_ports():
         except (OSError, serial.SerialException):
             pass
     return result
+
+
+def can_open(port):
+    """Return True if the serial port can be opened right now.
+
+    False covers both 'does not exist' and 'exists but is busy / access denied'.
+    """
+    try:
+        s = serial.Serial(port)
+        s.close()
+        return True
+    except (OSError, serial.SerialException):
+        return False
+
 
 if __name__ == '__main__':
     print(serial_ports())

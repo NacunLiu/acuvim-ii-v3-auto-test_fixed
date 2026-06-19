@@ -1,0 +1,13 @@
+services:
+  communication_protocol_test:
+    build: .
+    image: communication_protocol_test:1.0
+    container_name: communication_protocol_test
+    environment:
+      - COM_PORT="${COM_PORT}"
+      - SWITCH="${SWITCH}"
+    volumes:
+      - ./reports:/app/reports
+    profiles:
+      - modbus
+      

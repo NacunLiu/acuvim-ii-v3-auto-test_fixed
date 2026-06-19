@@ -8,8 +8,8 @@ ALL Changes to plug subject are using awaitable methods (Async), you must await 
 Add-on fe
 
 """
-from kasaPlug import KasaSmartPlug
-from ip_tracker import targetIp
+from acuvim_test.hardware.kasa_plug import KasaSmartPlug
+from acuvim_test.hardware.ip_tracker import get_target_ip_map
 import asyncio
 class miniKasa(KasaSmartPlug):
     
@@ -21,9 +21,9 @@ class miniKasa(KasaSmartPlug):
             await self.powerCycle(50)
             
 if __name__ == '__main__':
-    PlugIp = targetIp
+    PlugIp = get_target_ip_map()
     for ip in PlugIp:
-        KasaPlug = miniKasa(ip)
+        KasaPlug = miniKasa(PlugIp[ip][1])
         asyncio.run(KasaPlug.recurring_switch())
 
     
