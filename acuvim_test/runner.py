@@ -136,6 +136,7 @@ class TestRunner:
         self.pid = None
         self.address = None
         self.static_ip = None  # set by caller: user-entered IP, or None => reuse DHCP address
+        self.skip_energy = False  # set by caller: skip the S2 energy edit/retention test
         self.meter_family = None  # cached result of meterModelScan
 
     # Record a test failure: bump the count and keep the message for reporting.
@@ -197,6 +198,9 @@ class TestRunner:
         asyncio.run(asyncFlagTest(self))  # connection on different baud rates + latency
 
     def seg_energy(self):
+        if self.skip_energy:
+            logger.info('{} Energy edit/retention test SKIPPED by user'.format(self.serialNum))
+            return
         Model = self.family()
         if Model in ('B_NEW', 'B_OLD'):
             # ABB (CS0/CS2): float energy region, no display-mode loop, no independent channel.
@@ -395,6 +399,18 @@ def ask_static_ip():
         print('Not a valid IPv4 address, try again.', flush=True)
 
 
+def ask_skip_energy():
+    """Q: skip the energy edit/retention test (S2)? Returns True to skip. All meter types."""
+    while True:
+        ans = _ask('Skip the energy read/write (retention) test?',
+                   options=['Y = skip it', 'N = run it']).upper()
+        if ans in ('Y', 'YES'):
+            return True
+        if ans in ('N', 'NO'):
+            return False
+        print('Please answer Y or N.', flush=True)
+
+
 def ask_use_switch():
     """Q: power-cycle mode. True = Kasa switch, False = manual. Requires explicit Y/N."""
     while True:
@@ -496,12 +512,13 @@ def _resume_decision(runner):
     return start, True
 
 
-def run_single_meter(config, use_switch, static_ip, browser_lock, yabe_lock):
+def run_single_meter(config, use_switch, static_ip, skip_energy, browser_lock, yabe_lock):
     """Run one meter in the main process: interactive retry + resumable. Returns failCount."""
     port, plug_ip = config
     plug = KasaSmartPlug(plug_ip) if use_switch else None
     runner = TestRunner(1, plug, port, use_switch=use_switch)
     runner.static_ip = static_ip
+    runner.skip_energy = skip_energy
     runner.read_serial()
     start_index, append_log = _resume_decision(runner)
     runner.open_log(append=append_log)
@@ -513,7 +530,7 @@ def run_single_meter(config, use_switch, static_ip, browser_lock, yabe_lock):
         runner.close_log()
 
 
-def _run_meter_process(config, pnum, use_switch, shared_failCount, browser_lock, yabe_lock):
+def _run_meter_process(config, pnum, use_switch, skip_energy, shared_failCount, browser_lock, yabe_lock):
     """Child-process entry for multi-meter parallel runs (non-interactive, no resume).
 
     Multi-meter always reuses each meter's own DHCP address as its static IP
@@ -522,6 +539,7 @@ def _run_meter_process(config, pnum, use_switch, shared_failCount, browser_lock,
     plug = KasaSmartPlug(plug_ip) if use_switch else None
     runner = TestRunner(pnum, plug, port, use_switch=use_switch)
     runner.static_ip = None  # reuse per-meter DHCP address
+    runner.skip_energy = skip_energy
     runner.read_serial()
     runner.open_log(append=False)
     try:
@@ -533,12 +551,12 @@ def _run_meter_process(config, pnum, use_switch, shared_failCount, browser_lock,
             shared_failCount.value += 1
 
 
-def run_multi(configs, use_switch, browser_lock, yabe_lock):
+def run_multi(configs, use_switch, skip_energy, browser_lock, yabe_lock):
     """Run multiple meters in parallel (one process each). Returns count of meters with failures."""
     shared_failCount = multiprocessing.Value('i', 0)
     procs = [
         multiprocessing.Process(target=_run_meter_process,
-                                args=(c, i + 1, use_switch, shared_failCount, browser_lock, yabe_lock))
+                                args=(c, i + 1, use_switch, skip_energy, shared_failCount, browser_lock, yabe_lock))
         for i, c in enumerate(configs)
     ]
     for p in procs:
