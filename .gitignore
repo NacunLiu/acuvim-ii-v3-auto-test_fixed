@@ -2,6 +2,7 @@ __pycache__/
 *.csv
 *.ini
 *.log
+*.progress
 scan_results.txt
 .dockerignore
 Dockerfile

@@ -10,13 +10,24 @@ from acuvim_test.modbus_client import make_serial_client
 
 
 class AccuenergyModbusRequest():
-    def __init__(self, Port, Baudrate):
-        self.address = reg.REBOOT_COUNTER
+    def __init__(self, Port, Baudrate, is_abb=False):
+        # ABB families (old ABB Class S + M4M40) relocate the reboot-counter and
+        # latency registers (54528/54530 vs 38144/38146). The custom 0x6A reset
+        # command embeds the target address, so build both from the addresses.
+        self.address = reg.REBOOT_COUNTER_ABB if is_abb else reg.REBOOT_COUNTER
+        latency_addr = reg.LATENCY_REG_ABB if is_abb else reg.LATENCY_REG
         self.count = 16
         self.Port = Port
         self.BR = Baudrate
-        self.reset_counter = bytearray([0x01, 0x6A, 0x95, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00])
-        self.reset_latency = bytearray([0x01, 0x6A, 0x95, 0x02, 0x00, 0x01, 0x02, 0x00, 0x00])
+        self.reset_counter = self._reset_cmd(self.address)
+        self.reset_latency = self._reset_cmd(latency_addr)
+
+    @staticmethod
+    def _reset_cmd(address):
+        """Custom 0x6A 'write zero' command for `address`:
+        01 6A <addr_hi> <addr_lo> 00 01 02 00 00 (CRC appended by the caller)."""
+        return bytearray([0x01, 0x6A, (address >> 8) & 0xFF, address & 0xFF,
+                          0x00, 0x01, 0x02, 0x00, 0x00])
 
     # readCounter function
     # Usage: this function will read reboot counter

@@ -23,10 +23,41 @@ BACNET_ID = 8451         # BACnet device id (2 words)
 ENERGY_RESET = 4118      # write 1 to clear all energy
 DISPLAY_MODE = 4121      # decimal-point / display mode (0/1/2)
 
+# Energy register regions (start addresses) tested by energyLegitCheck.
+ENERGY_TOTAL = 16456           # Total Ep/Eq/Es (imp/exp/total/net)  -> web "Total" block
+ENERGY_PHASE = 17952           # per-phase Ep/Eq                     -> web "Phase" block
+ENERGY_PHASE_APPARENT = 18688  # per-phase apparent energy Es        -> web "Phase" block (Es)
+ENERGY_FOUR_QUADRANT = 18704   # four-quadrant reactive Eq (Q1-Q4)   -> web "Four-Quadrant" block
+ENERGY_INDEP_CHANNEL = 9472    # independent input channel energy    -> not shown on the web page
+
+# ABB meters (CS0/CS2 families) use the Energy_1Cycle region instead, R/W:
+# 96 energy values starting here. New M4M40 stores them as float64 (4 regs each),
+# old Acuvim IIX Class S as float32 (2 regs each). Same start address for both.
+ABB_ENERGY_1CYCLE = 50412      # 0xC4EC, 96 energy values (R/W)
+ABB_ENERGY_COUNT = 96
+
+# Friendly names for the energy regions (used in log labels).
+ENERGY_REGION_NAMES = {
+    ENERGY_TOTAL: 'Total energy',
+    ENERGY_PHASE: 'Phase Ep/Eq',
+    ENERGY_PHASE_APPARENT: 'Phase apparent Es',
+    ENERGY_FOUR_QUADRANT: 'Four-quadrant Eq',
+    ENERGY_INDEP_CHANNEL: 'Independent channel',
+}
+
+
+def energy_label(address, extra=''):
+    """Build a log label like 'Total energy (16456)' or 'Total energy (16456) - max Ep/q/s'."""
+    base = '{} ({})'.format(ENERGY_REGION_NAMES.get(address, 'Energy region'), address)
+    return '{} - {}'.format(base, extra) if extra else base
+
 # Diagnostics / identity
 CUSTOM_REG_DEFAULT = 27136  # custom register, default 0
-REBOOT_COUNTER = 38144      # reboot counter
-LATENCY_REG = 38146         # communication latency register
+REBOOT_COUNTER = 38144      # reboot counter (Accuenergy / Eaton / DEIF), 0x9500
+LATENCY_REG = 38146         # communication latency register, 0x9502
+# ABB families (old ABB Class S + new M4M40) relocate these two registers.
+REBOOT_COUNTER_ABB = 54528  # reboot counter (ABB), 0xD500
+LATENCY_REG_ABB = 54530     # communication latency register (ABB), 0xD502
 MODEL = 61440               # model string (2 words)
 SERIAL_NUMBER = 61504       # serial number string (6 words)
 METER_TYPE = 61552          # meter type code

@@ -12,7 +12,7 @@ from acuvim_test.log import logger
 from acuvim_test.modbus_client import (
     make_serial_client, make_async_serial_client, syncConnectWrite,
     asyncReadRegisters, AsyncModbusCheckReadRegisters,
-    asyncConnectWrite, asyncConnectWriteMultipleRegisters,
+    asyncConnectWrite, asyncConnectWriteMultipleRegisters, write_blocks,
 )
 from acuvim_test.modbus_request import AccuenergyModbusRequest
 from acuvim_test.reboot import reboot_meter
@@ -105,46 +105,53 @@ async def asyncConnectIp(acuClass):
     await asyncio.sleep(10)
 
 
+def ip_to_registers(ip):
+    """'192.168.61.42' -> [0xC0A8, 0x3D2A] = [49320, 15658] (two 16-bit words)."""
+    a, b, c, d = (int(x) for x in ip.strip().split('.'))
+    return [(a << 8) | b, (c << 8) | d]
+
+
 ################################################################################
-# Purpose: Modify IP address and disabled DHCP  /preset address: 192.168.61.42/or 61.43
-async def AsyncManualIpWrite(acuClass, Address=reg.IP_ADDRESS, Value=[49320, 15658]):
-    logger.info('{} Manual DHCP Test in process.....'.format(acuClass.serialNum))
-    await asyncConnectWrite(acuClass, reg.DHCP_ENABLE, [0], 'Disabling DHCP....')  # set to DHCP Disabled
-    if (acuClass.processNum == 1):
-        await asyncConnectWrite(acuClass, Address, Value)
-    elif (acuClass.processNum == 2):
-        await asyncConnectWrite(acuClass, Address, [49320, 15659])  # 192.168.61.43
+# Purpose: Disable DHCP and write a static IP (acuClass.static_ip).
+async def AsyncManualIpWrite(acuClass, Address=reg.IP_ADDRESS):
+    ip = acuClass.static_ip
+    if not ip:
+        logger.error('{} static IP test skipped: no static IP resolved'.format(acuClass.serialNum))
+        return
+    logger.info('{} Static IP test: writing {}'.format(acuClass.serialNum, ip))
+    await asyncConnectWrite(acuClass, reg.DHCP_ENABLE, [0], 'Disabling DHCP....')  # DHCP off
+    await asyncConnectWrite(acuClass, Address, ip_to_registers(ip), 'Writing static IP {}'.format(ip))
     await reboot_meter(acuClass, boot_wait=90, reason='apply manual IP / disable DHCP')
     await asyncConnectIp(acuClass)
 
 
 ################################################################################
-# Nothing diff to asyncConnectWrite function except an option to clear out all energy
+# Write one energy block (optionally clearing all energy first), on a SINGLE
+# connection that's held until the whole write is done, then released.
 async def asyncManualEnergyWrite(acuClass, Address, Values: list, Reset):
-    if (Reset):
-        await asyncConnectWrite(acuClass, reg.ENERGY_RESET, [1])
-        await asyncio.sleep(3)
-    await asyncConnectWrite(acuClass, Address, Values)
+    await write_blocks(acuClass, [(Address, Values)], reset=Reset)
     await asyncio.sleep(3)
 
 
 #########################################
-# Purpose: Generate some Energy readings
+# Purpose: Generate energy readings across 4 regions in ONE connection.
 async def AsyncManualEnergyWriteLegacy(acuClass):
     logger.debug('Generating manual Energy in progress...')
-    # Ep_imp, Ep_exp, Eq, Es, etc
-    await asyncConnectWrite(acuClass, 16456, [20, 31679, 0, 21347, 0, 20528, 1, 57872, 20,
-                                              53026, 20, 10332, 2, 12865, 21, 62748, 21, 62748])
-    # Es_imp, Esa, Esb, phase-wise energy
-    await asyncConnectWrite(acuClass, 18688, [21, 62748, 7, 18954, 7, 21871, 7, 21992, 0, 0, 0, 0, 0, 0, 0, 0])
-    # Epa, Epb, phase-wise energy
-    await asyncConnectWrite(acuClass, 17952, [6, 47101, 0, 6775, 6, 52223, 0, 12060, 6, 63425, 0,
-                                              2511, 0, 3200, 0, 49436, 0, 11760, 0, 35876, 0, 5567,
-                                              0, 38094, 7, 18954, 7, 21871, 7, 21922])
-    # four-quad energy q
-    await asyncConnectWrite(acuClass, 18704, [3, 61059, 0, 835, 0, 1430, 0, 4828, 0, 35539,
-                                              0, 2365, 0, 10330, 0, 739, 0, 10944, 0, 13722,
-                                              0, 860, 0, 3081, 3, 39377, 0, 35713, 0, 35016, 0, 35013])
+    await write_blocks(acuClass, [
+        # Ep_imp, Ep_exp, Eq, Es, etc
+        (16456, [20, 31679, 0, 21347, 0, 20528, 1, 57872, 20,
+                 53026, 20, 10332, 2, 12865, 21, 62748, 21, 62748]),
+        # Es_imp, Esa, Esb, phase-wise energy
+        (18688, [21, 62748, 7, 18954, 7, 21871, 7, 21992, 0, 0, 0, 0, 0, 0, 0, 0]),
+        # Epa, Epb, phase-wise energy
+        (17952, [6, 47101, 0, 6775, 6, 52223, 0, 12060, 6, 63425, 0,
+                 2511, 0, 3200, 0, 49436, 0, 11760, 0, 35876, 0, 5567,
+                 0, 38094, 7, 18954, 7, 21871, 7, 21922]),
+        # four-quad energy q
+        (18704, [3, 61059, 0, 835, 0, 1430, 0, 4828, 0, 35539,
+                 0, 2365, 0, 10330, 0, 739, 0, 10944, 0, 13722,
+                 0, 860, 0, 3081, 3, 39377, 0, 35713, 0, 35016, 0, 35013]),
+    ])
 
 
 async def asyncDHCPEnablePowerCycle(acuClass):
@@ -242,16 +249,19 @@ LATENCY_ALERT = 140
 
 async def asyncFlagChecking(acuClass, resetEnable: bool):
     client = make_async_serial_client(acuClass.COM, acuClass.BR)
+    # ABB families (old ABB Class S + M4M40) use a relocated latency register.
+    is_abb = acuClass.is_abb()
+    latency_addr = reg.LATENCY_REG_ABB if is_abb else reg.LATENCY_REG
     latency = None
     if (resetEnable):
         try:
             logger.debug('Erasing Latency Register....')
-            newTest = AccuenergyModbusRequest(acuClass.COM, acuClass.BR)
+            newTest = AccuenergyModbusRequest(acuClass.COM, acuClass.BR, is_abb=is_abb)
             await newTest.rebootLatency()
             await asyncio.sleep(1)
             await client.connect()
             await asyncio.sleep(1)
-            RR = await asyncReadRegisters(client, reg.LATENCY_REG, 1)
+            RR = await asyncReadRegisters(client, latency_addr, 1)
             latency = RR.registers[-1]
             logger.info('Latency Register Reading: {}'.format(latency))
         except asyncio.exceptions.CancelledError:
@@ -260,7 +270,7 @@ async def asyncFlagChecking(acuClass, resetEnable: bool):
     else:
         await client.connect()
         await asyncio.sleep(1)
-        RR = await asyncReadRegisters(client, reg.LATENCY_REG, 1)
+        RR = await asyncReadRegisters(client, latency_addr, 1)
         latency = RR.registers[-1]
         logger.info('Latency Register Reading: {}'.format(latency))
     client.close()
@@ -293,7 +303,14 @@ async def meterMountTypeScan(acuClass):
         logger.info("{} is a non-display meter; BACnet auto-config skipped".format(acuClass.serialNum))
 
 
-# This function will read the meter model, will return a leter to indicate meter type
+# ABB families share the CS0/CS2 3-char prefix, so they're distinguished by the
+# full 4-char model code: new M4M40 stores energy as float64, old Acuvim IIX as float32.
+ABB_NEW_MODELS = {'CS07', 'CS08', 'CS09', 'CS0A', 'CS0B'}        # M4M40 / D4M40  -> 'B_NEW'
+ABB_OLD_MODELS = {'CS06', 'CS26', 'CS46', 'CG06', 'CG26', 'CG46'}  # Acuvim IIX     -> 'B_OLD'
+
+
+# Read the meter model; return a family code: 'A' Accuenergy, 'E' Eaton, 'D' DEIF,
+# 'B_NEW' ABB M4M40 (float64), 'B_OLD' ABB Acuvim IIX (float32), or None if unknown.
 def meterModelScan(acuClass) -> str:
     MeterFamily = defaultdict(list)
     MeterFamily['A'] = ['CU0', 'CP0', 'CP2', 'CP4', 'CU2', 'CV0', 'CM0']  # Accuenergy model
@@ -311,6 +328,12 @@ def meterModelScan(acuClass) -> str:
         hex_bytes = bytes.fromhex(ascii_hex)
         Model += hex_bytes.decode('ascii')
 
+    logger.info('{} model code: {}'.format(acuClass.serialNum, Model))
+    # ABB first (needs the full 4-char code; CS06 vs CS07 share the 'CS0' prefix).
+    if Model[:4] in ABB_NEW_MODELS:
+        return 'B_NEW'
+    if Model[:4] in ABB_OLD_MODELS:
+        return 'B_OLD'
     for key in MeterFamily:
         if (Model[:3] in MeterFamily[key]):
             return (key)
@@ -378,36 +401,48 @@ def pingTest(acuClass, open_browser=False):
 ##########################################
 # Compare energy readings with reference [contents]
 async def ReadingComparator(acuClass, contents, start_address, size):
+    logger.info('{} reading back {} registers from address {} to verify write...'
+                .format(acuClass.serialNum, size, start_address))
     Energy = await checkEnergy(acuClass, start_address, size)
-    try:
-        assert Energy == contents
+    if Energy == contents:
+        logger.info('{} read-back MATCHES the written energy (address {})'
+                    .format(acuClass.serialNum, start_address))
         return True
-    except AssertionError as e:
-        logger.warning(e)
-        return False
+
+    # Report exactly which registers differ (address: wrote X, read Y).
+    mismatches = []
+    for i in range(min(len(contents), len(Energy))):
+        if Energy[i] != contents[i]:
+            mismatches.append('reg {} wrote {} read {}'.format(start_address + i, contents[i], Energy[i]))
+    if len(Energy) != len(contents):
+        mismatches.append('length wrote {} read {}'.format(len(contents), len(Energy)))
+    logger.error('{} read-back MISMATCH at address {} ({} reg(s) differ): {}'
+                 .format(acuClass.serialNum, start_address, len(mismatches), '; '.join(mismatches[:20])))
+    return False
 
 
 # Energy edit/read sub-tests. Each is (label, start_address, contents). The
 # common set runs on every meter model; the "independent input channel" set
 # (was SequenceId 7/8) only runs on Accuenergy-family meters (not Eaton/DEIF).
 _MAX = [15258, 51711]   # max positive Ep/q/s sample
-
-
 _NEG = [50277, 13825]   # negative sample
 
-
+# Labels are "<region name> (<address>) - <pattern>" so logs say exactly which
+# energy block (and register address) each sub-test covers.
 ENERGY_TESTS_COMMON = [
-    ('Three-phase max Ep/q/s reading (1.1)', 16456, _MAX * 9),
-    ('Three-phase Negative Ep/q (1.2)', 16456, _MAX * 5 + _NEG + _MAX + _NEG + _MAX),
-    ('Max Import/Export Ep/q/s (2)', 17952, _MAX * 15),
-    ('Max Import/Export apparent energy (3)', 18688, _MAX * 8),
-    ('Reactive 4-Q (4)', 18704, _MAX * 16),
+    (reg.energy_label(reg.ENERGY_TOTAL, 'max Ep/q/s (1.1)'), reg.ENERGY_TOTAL, _MAX * 9),
+    (reg.energy_label(reg.ENERGY_TOTAL, 'negative Ep/q (1.2)'), reg.ENERGY_TOTAL,
+     _MAX * 5 + _NEG + _MAX + _NEG + _MAX),
+    (reg.energy_label(reg.ENERGY_PHASE, 'max import/export (2)'), reg.ENERGY_PHASE, _MAX * 15),
+    (reg.energy_label(reg.ENERGY_PHASE_APPARENT, 'max import/export Es (3)'), reg.ENERGY_PHASE_APPARENT, _MAX * 8),
+    (reg.energy_label(reg.ENERGY_FOUR_QUADRANT, 'reactive 4-Q (4)'), reg.ENERGY_FOUR_QUADRANT, _MAX * 16),
 ]
 
 
 ENERGY_TESTS_INDEPENDENT = [
-    ('4Q Ep/q/s & channel 4 Max Energy (6a)', 9472, _MAX * 32),
-    ('4Q Ep/q/s & channel 4 Min Energy (6b)', 9472, _MAX * 14 + (_NEG + _MAX * 3) * 2 + _MAX * 12),
+    (reg.energy_label(reg.ENERGY_INDEP_CHANNEL, 'max (6a)'), reg.ENERGY_INDEP_CHANNEL, _MAX * 32),
+    (reg.energy_label(reg.ENERGY_INDEP_CHANNEL, 'min (6b)'), reg.ENERGY_INDEP_CHANNEL,
+     _MAX * 14 + (_NEG + _MAX * 3) * 2 + _MAX * 12),
 ]
 
 
@@ -445,27 +480,36 @@ async def energyLegitCheck(acuClass, Display, MeterModel):
     await EnergyMemoryRetention(acuClass, False)
 
 
-# Purpose: Check if other energy reading regions are NULL
+# Purpose: confirm the OTHER energy regions are still zero (write didn't bleed over).
+# Sizes are register counts read per region (kept as in the original test).
+_MEMORY_REGION_SIZES = {
+    reg.ENERGY_TOTAL: 9,
+    reg.ENERGY_PHASE: 15,
+    reg.ENERGY_PHASE_APPARENT: 8,
+    reg.ENERGY_FOUR_QUADRANT: 16,
+    reg.ENERGY_INDEP_CHANNEL: 32,
+}
+
+
 async def isMemorySectionEmpty(acuClass, StartAddress):
     client = make_async_serial_client(acuClass.COM, acuClass.BR)
     await client.connect()
     await asyncio.sleep(1)
-    MemoryAddress = defaultdict(int)
-    MemoryAddress[16456] = 9
-    MemoryAddress[17952] = 15
-    MemoryAddress[18688] = 8
-    MemoryAddress[18704] = 16
-    MemoryAddress[9472] = 32
-    for address, size in MemoryAddress.items():
-        if (address != StartAddress):
-            Readings = await asyncReadRegisters(client, address, size)
-            try:
-                assert all(x == 0 for x in Readings.registers)
-            except AssertionError as e:
-                acuClass.failCount += 1
-                acuClass.failTest.append(e)
+    all_clear = True
+    for address, size in _MEMORY_REGION_SIZES.items():
+        if address == StartAddress:
+            continue
+        readings = await asyncReadRegisters(client, address, size)
+        if not all(x == 0 for x in readings.registers):
+            all_clear = False
+            name = reg.ENERGY_REGION_NAMES.get(address, 'region')
+            msg = '{} {} ({}) should be empty but is not: {}'.format(
+                acuClass.serialNum, name, address, readings.registers)
+            logger.error(msg)
+            acuClass.fail(msg)
     client.close()
-    logger.info('{} Unwritten Memory Section Check Passed'.format(acuClass.serialNum))
+    if all_clear:
+        logger.info('{} other energy regions are empty as expected'.format(acuClass.serialNum))
     await asyncio.sleep(1)
 
 

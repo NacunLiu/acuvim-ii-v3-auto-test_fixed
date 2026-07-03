@@ -28,8 +28,8 @@ from typing import Dict, Tuple
 # nmap/MAC scan is skipped entirely (no nmap needed, works even if WiFi blocks
 # discovery). Get each plug's IP from the Kasa app (Device Info) or your router.
 PLUG_IPS: Dict[int, str] = {
-    # 1: "172.27.24.50",
-    # 2: "172.27.24.51",
+    1: "172.27.25.233",   # Kasa HS103 "Acuvim_test" (MAC 10:5A:95:3F:CD:19)
+    2: "172.27.24.166",   # Kasa HS103 "Acuvim_test" (MAC 78:8C:B5:B5:07:58)
 }
 
 # FALLBACK (used only when PLUG_IPS is empty): discover plugs by MAC via nmap.

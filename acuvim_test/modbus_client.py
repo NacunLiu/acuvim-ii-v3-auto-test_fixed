@@ -14,10 +14,14 @@ from acuvim_test.log import logger
 # ---- Modbus client factories -------------------------------------------------
 # Single source of truth for the meter's RS485 line settings. If the pymodbus
 # API changes (e.g. a 3.13 migration), update only these two functions.
-def make_serial_client(port, baudrate):
-    """Sync Modbus-RTU client with the project's standard line settings."""
+def make_serial_client(port, baudrate, timeout=1):
+    """Sync Modbus-RTU client with the project's standard line settings.
+
+    timeout (seconds) is overridable for the packet-loss test, which uses a
+    short per-request timeout (50 ms) to count unanswered requests.
+    """
     return ModbusSerialClient(method='rtu', port=port, baudrate=baudrate, parity='N',
-                              stopbits=1, bytesize=8, timeout=1, framer=ModbusRtuFramer)
+                              stopbits=1, bytesize=8, timeout=timeout, framer=ModbusRtuFramer)
 
 
 def make_async_serial_client(port, baudrate):
@@ -26,7 +30,7 @@ def make_async_serial_client(port, baudrate):
                                    stopbits=1, bytesize=8, timeout=1, framer=ModbusRtuFramer)
 
 
-async def connect_with_retry(client, port, attempts=3, delay=2):
+async def connect_with_retry(client, port, attempts=3, delay=2): 
     """Open `client`, retrying if the COM port is briefly unavailable.
 
     On Windows the OS may not have released the serial handle yet from a prior
@@ -159,6 +163,43 @@ async def asyncConnectWrite(acuClass, Address: int, \
         logger.warning('Unable to write {}'.format(e))
         acuClass.fail('asyncConnectWrite function failed address: {}'.format(Address))
     client.close()
+    await asyncio.sleep(2)
+
+
+async def _write_one(client, address, values):
+    """Write one contiguous block on an already-connected client."""
+    builder = BinaryPayloadBuilder(byteorder=Endian.Big)
+    addr = address
+    for v in values:
+        v = int(v)
+        logger.debug('writing {} to {}'.format(v, addr))
+        addr += 1
+        builder.add_16bit_uint(v)
+    await client.write_registers(address, builder.to_registers(), slave=1)
+
+
+async def write_blocks(acuClass, blocks, reset=False):
+    """Open ONE connection, optionally clear energy, write each (address, values)
+    block, then close. Holding a single connection for the whole write avoids the
+    per-write reconnect contention ('Access is denied' when reopening the same COM
+    port back-to-back) and is much faster than connect-per-register-block.
+    """
+    client = make_async_serial_client(acuClass.COM, acuClass.BR)
+    try:
+        if not await connect_with_retry(client, acuClass.COM):
+            raise ConnectionError('could not open {}'.format(acuClass.COM))
+        logger.debug('RTU Connection Status: {} (single-connection write)'.format(client.connected))
+        if reset:
+            await _write_one(client, reg.ENERGY_RESET, [1])
+            await asyncio.sleep(3)
+        for address, values in blocks:
+            await _write_one(client, address, values)
+            await asyncio.sleep(1)
+    except Exception as e:
+        logger.warning('Unable to write energy blocks: {}'.format(e))
+        acuClass.fail('energy write failed: {}'.format(e))
+    finally:
+        client.close()
     await asyncio.sleep(2)
 
 

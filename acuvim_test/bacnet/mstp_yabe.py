@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 # Lowered from the old hard 0.9 to cut false negatives. Tune as needed.
 SSIM_THRESHOLD = 0.6
 
+# Seconds to wait after starting the YABE scan before grabbing the screenshot.
+# The meter can be slow to respond to YABE, so wait at least ~2 minutes.
+SCAN_WAIT_SECONDS = 120
+
 class Client():
     def __init__(self,Serial,id):
         self.start_scan_button_location = None
@@ -122,6 +126,15 @@ class Client():
             return False
         logger.info('BACnet MS/TP SSIM={:.3f} (threshold {})'.format(self.ssim_value, SSIM_THRESHOLD))
         return self.ssim_value >= SSIM_THRESHOLD
+
+    # Purpose: re-grab the device panel and re-compare, WITHOUT relaunching or
+    # closing YABE. Used for manual retry after the operator has opened YABE,
+    # scanned, and connected the meter (e.g. when YABE was too slow the 1st time).
+    def recheck(self):
+        screenshot = ImageGrab.grab(bbox=(0, 95, 184, 440))
+        screenshot.save(self.test_path)
+        self.compare_images()
+        return self.checkSSIM()
         
     # Purpose: execute sequential commands to perform bacnect connection test
     def run(self):
@@ -144,7 +157,8 @@ class Client():
             pyautogui.click(self.secMeter)
         sleep(1)
         pyautogui.click(self.test_start)
-        sleep(50)
+        logger.info('BACnet MS/TP: waiting {}s for the meter to respond to YABE...'.format(SCAN_WAIT_SECONDS))
+        sleep(SCAN_WAIT_SECONDS)
         pyautogui.click(self.first_slave)
         sleep(5)
         self.take_screenshot()
