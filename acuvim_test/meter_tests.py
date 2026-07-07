@@ -13,6 +13,7 @@ from acuvim_test.modbus_client import (
     make_serial_client, make_async_serial_client, syncConnectWrite,
     asyncReadRegisters, AsyncModbusCheckReadRegisters,
     asyncConnectWrite, asyncConnectWriteMultipleRegisters, write_blocks,
+    sync_connect_with_retry, connect_with_retry,
 )
 from acuvim_test.modbus_request import AccuenergyModbusRequest
 from acuvim_test.reboot import reboot_meter
@@ -259,7 +260,7 @@ async def asyncFlagChecking(acuClass, resetEnable: bool):
             newTest = AccuenergyModbusRequest(acuClass.COM, acuClass.BR, is_abb=is_abb)
             await newTest.rebootLatency()
             await asyncio.sleep(1)
-            await client.connect()
+            await connect_with_retry(client, acuClass.COM)
             await asyncio.sleep(1)
             RR = await asyncReadRegisters(client, latency_addr, 1)
             latency = RR.registers[-1]
@@ -268,7 +269,7 @@ async def asyncFlagChecking(acuClass, resetEnable: bool):
             logger.warning('Flag check ERROR')
 
     else:
-        await client.connect()
+        await connect_with_retry(client, acuClass.COM)
         await asyncio.sleep(1)
         RR = await asyncReadRegisters(client, latency_addr, 1)
         latency = RR.registers[-1]
@@ -317,7 +318,13 @@ def meterModelScan(acuClass) -> str:
     MeterFamily['E'] = ['CRD', 'CPG', 'CXD', 'CPD', 'CUG', 'CUD', 'CPE', 'CPH']  # Eaton model
     MeterFamily['D'] = ['CPB', 'CUB'] # DEIF model
     client = make_serial_client(acuClass.COM, acuClass.BR)
-    client.connect()
+    # Retry the open: right after the async serial-number read the OS may not have
+    # released the COM handle yet, so a plain connect() can hit 'Access is denied'.
+    if not sync_connect_with_retry(client, acuClass.COM):
+        logger.warning('{} could not open {} to read the model (port busy / held by '
+                       'another program?); family unknown'.format(acuClass.serialNum, acuClass.COM))
+        client.close()
+        return None
     sleep(1)
     RR = client.read_holding_registers(reg.MODEL, count=2, slave=1)
     sleep(1)

@@ -84,6 +84,27 @@ async def connect_with_retry(client, port, attempts=3, delay=2):
     return False
 
 
+def sync_connect_with_retry(client, port, attempts=3, delay=2):
+    """Sync counterpart of connect_with_retry. On Windows the OS may not have
+    released the serial handle yet from a prior client's close() (e.g. the async
+    serial client used to read the serial number), so a fresh open() can fail with
+    'Access is denied'. Retry with a short delay. Returns True if the port opened.
+    """
+    for i in range(1, attempts + 1):
+        try:
+            if client.connect():
+                return True
+        except Exception as e:
+            logger.warning('connect {} attempt {}/{} raised: {}'.format(port, i, attempts, e))
+        if getattr(client, 'connected', False):
+            return True
+        logger.warning('{} not ready (attempt {}/{}), retrying in {}s...'.format(port, i, attempts, delay))
+        sleep(delay)
+    logger.error('Could not open {} after {} attempts (port busy? held by another program?)'
+                 .format(port, attempts))
+    return False
+
+
 ###########################################
 # Purpose:
 # synchronous connect and write through modbus rtu, allow changing protocol 1 from Modbus to Bacnet; NO NEED TO REBOOT
