@@ -7,11 +7,13 @@ import logging
 import multiprocessing
 from time import sleep
 
+from acuvim_test import registers as reg
 from acuvim_test.log import logger
 from acuvim_test.modbus_request import AccuenergyModbusRequest
-from acuvim_test.modbus_client import AsyncReadSerialId
+from acuvim_test.modbus_client import AsyncReadSerialId, tcp_set_registers
+from acuvim_test.reboot import reboot_meter
 from acuvim_test.bacnet.ip_test import run_bacnet_ip_test
-from acuvim_test.bacnet.mstp_yabe import Client
+from acuvim_test.bacnet.mstp_yabe import Client, SSIM_THRESHOLD
 from acuvim_test.hardware.kasa_plug import KasaSmartPlug
 from acuvim_test.hardware.ip_tracker import get_target_ip_map
 from acuvim_test.hardware.port_finder import serial_ports, can_open
@@ -40,16 +42,28 @@ def BACnetConnectionTest(acuClass):
     passed = client.run()  # automated YABE flow (includes the ~120s scan wait)
     # YABE can be slow to load; if the comparison failed, let the operator fix
     # YABE by hand and re-check, instead of failing immediately.
+    # Auto screenshot compare failed -> fall back to a MANUAL comparison: the
+    # operator opens/connects the meter in YABE, eyeballs it, and reports the
+    # verdict. Both verdicts continue the test (N just records the failure).
     while not passed:
         ssim = client.ssim_value if client.ssim_value is not None else 0.0
         try:
-            ans = input('\n[BACnet MS/TP] YABE comparison failed (SSIM={:.3f}).\n'
-                        '  Open YABE, scan and connect the meter so its data shows, then\n'
-                        '  press Enter to re-check, or type N to record it as FAILED: '
-                        .format(ssim)).strip().upper()
+            ans = input('\n[BACnet MS/TP] Auto screenshot compare failed (SSIM={:.3f}, need >= {}).\n'
+                        '  Do a MANUAL comparison: open YABE, scan and connect the meter, and check\n'
+                        '  its data shows correctly. Then:\n'
+                        '    P     = manual comparison PASSED -> continue\n'
+                        '    N     = manual comparison FAILED -> record to log and continue\n'
+                        '    Enter = re-run the automatic screenshot compare\n'
+                        '  Choice: '
+                        .format(ssim, SSIM_THRESHOLD)).strip().upper()
         except (EOFError, RuntimeError):
             break  # no console (multi-meter child process) -> record failure
         if ans in ('N', 'NO'):
+            break
+        if ans in ('P', 'PASS', 'Y', 'YES'):
+            logger.info('{} BACnet MS/TP (YABE) PASSED by manual comparison (auto SSIM={:.3f})'
+                        .format(acuClass.serialNum, ssim))
+            passed = True
             break
         passed = client.recheck()
     if passed:
@@ -256,6 +270,60 @@ class TestRunner:
         with self.yabe_lock:
             BACnetConnectionTest(self)  # MS/TP via YABE (relaxed)
         BACnetIpTest(self)  # BACnet/IP via bacpypes3 (deterministic)
+        # meterMountTypeScan switched channel 1 to BACnet MS/TP, and that takes
+        # effect immediately -- once the RS485 line is BACnet it can NOT be
+        # switched back over serial. The next segment (S6 packet loss) is
+        # Modbus-only, so switch channel 1 back to Modbus over the Web module's
+        # Modbus TCP gateway (which reaches the register map regardless of the
+        # channel-1 protocol). Fall back to a manual prompt if TCP can't do it.
+        if not self._restore_modbus_channel1_via_tcp():
+            self._prompt_restore_modbus_channel1()
+
+    def _restore_modbus_channel1_via_tcp(self):
+        """Switch RS485 channel 1 back to Modbus @ 19200 over Modbus TCP, then
+        reboot to apply. self.address is the Web module's current IP (re-learned
+        at the start of this segment via the 'OTHER' DHCP cycle, and the same IP
+        openBrowser last pinged). Returns True on success, False to fall back to
+        the manual prompt."""
+        ip = self.address
+        if not ip:
+            logger.warning('{} TCP channel-1 restore skipped: no meter IP known'
+                           .format(self.serialNum))
+            return False
+        logger.info('{} switching channel 1 back to Modbus @ 19200 over Modbus TCP ({})'
+                    .format(self.serialNum, ip))
+        try:
+            ok = tcp_set_registers(ip, [(reg.PROTOCOL_CH1, [0]),      # 0 = Modbus
+                                        (reg.BAUD_CH1, [19200])])
+        except Exception as e:
+            logger.warning('{} TCP channel-1 restore to {} errored: {}'
+                           .format(self.serialNum, ip, e))
+            return False
+        if not ok:
+            logger.warning('{} TCP channel-1 restore to {} failed'.format(self.serialNum, ip))
+            return False
+        logger.info('{} channel 1 set to Modbus over TCP; rebooting to apply'
+                    .format(self.serialNum))
+        asyncio.run(reboot_meter(self, boot_wait=90,
+                                 reason='apply Modbus on channel 1 (TCP restore after BACnet)'))
+        return True
+
+    def _prompt_restore_modbus_channel1(self):
+        """Manual step: operator sets channel 1 back to Modbus @ 19200 on the meter
+        display, since the BACnet switch can't be undone over Modbus. Falls back to
+        a warning when there is no console (multi-meter child process)."""
+        print('\n' + '=' * 60, flush=True)
+        print('BACnet test done. Channel 1 is now in BACnet MS/TP mode and can', flush=True)
+        print('NOT be switched back over Modbus.', flush=True)
+        print('  -> On the METER, set Channel 1 protocol back to Modbus, baud 19200.', flush=True)
+        print('  (If Channel 1 is already on Modbus, just press Enter.)', flush=True)
+        try:
+            input('Press Enter once Channel 1 is back on Modbus @ 19200 to continue... ')
+            logger.info('{} operator confirmed Channel 1 restored to Modbus @ 19200'
+                        .format(self.serialNum))
+        except (EOFError, RuntimeError):
+            logger.warning('{} no console to prompt for Channel 1 restore; if it is still '
+                           'in BACnet the packet-loss segment will fail'.format(self.serialNum))
 
     def seg_packet_loss(self):
         # Final test: Modbus @ 115200 packet-loss stress read, then restore the
@@ -474,42 +542,45 @@ def collect_manual_config():
 
 
 def _resume_decision(runner):
-    """If an unfinished run exists for this meter, ask whether/where to resume.
+    """Ask which segment to start from. Always prompts (Enter / 1 = full run from
+    the top). If an unfinished run exists for this meter, the default is the next
+    unfinished segment and choosing it appends to the existing log.
 
-    Returns (start_index, append_log). start_index=0 + append=False means a
-    fresh run from the top (overwrites the log).
+    Returns (start_index, append_log). start_index=0 + append=False means a fresh
+    run from the top (overwrites the log).
     """
     serial = runner.serialNum
     progress = load_progress(serial)
-    if not progress or progress.get('status') == 'done':
-        return 0, False  # no prior run, or it finished -> fresh run
+    unfinished = bool(progress and progress.get('status') != 'done')
 
-    done_through = progress.get('completed_through', -1)
-    next_idx = min(done_through + 1, len(SEGMENTS) - 1)
     print('\n' + '=' * 56, flush=True)
-    print('Detected an UNFINISHED previous test for meter {}.'.format(serial), flush=True)
-    last = SEGMENTS[done_through][0] if 0 <= done_through < len(SEGMENTS) else '(none)'
-    print('  Last completed segment: {}'.format(last), flush=True)
+    if unfinished:
+        done_through = progress.get('completed_through', -1)
+        default_idx = min(done_through + 1, len(SEGMENTS) - 1)
+        last = SEGMENTS[done_through][0] if 0 <= done_through < len(SEGMENTS) else '(none)'
+        print('Detected an UNFINISHED previous test for meter {}.'.format(serial), flush=True)
+        print('  Last completed segment: {}'.format(last), flush=True)
+    else:
+        default_idx = 0
+        print('Meter {}: choose the starting segment.'.format(serial), flush=True)
     print('  Segments:', flush=True)
     for i, seg in enumerate(SEGMENTS):
         print('    {} = {}'.format(i + 1, seg[0]), flush=True)
 
-    ans = _ask('Resume this meter\'s test?',
-               options=['Y = resume (append results to its existing log)',
-                        'N = start over from segment 1 (overwrite the log)']).upper()
-    if ans not in ('Y', 'YES'):
-        return 0, False
-
-    pick = _ask('Start from which segment number? (1-{}; Enter = {} = "{}")'
-                .format(len(SEGMENTS), next_idx + 1, SEGMENTS[next_idx][0]))
+    pick = _ask('Start from which segment number? (1-{}; Enter = {} = "{}"; 1 = run everything)'
+                .format(len(SEGMENTS), default_idx + 1, SEGMENTS[default_idx][0]))
     if pick == '':
-        start = next_idx
+        start = default_idx
     else:
         try:
             start = max(0, min(int(pick) - 1, len(SEGMENTS) - 1))
         except ValueError:
-            start = next_idx
-    return start, True
+            start = default_idx
+
+    # Append to the existing log only when continuing an unfinished run at a
+    # later segment; a fresh run (or an explicit restart at segment 1) overwrites.
+    append_log = unfinished and start > 0
+    return start, append_log
 
 
 def run_single_meter(config, use_switch, static_ip, skip_energy, browser_lock, yabe_lock):

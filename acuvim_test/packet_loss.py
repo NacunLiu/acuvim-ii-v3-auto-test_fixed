@@ -45,17 +45,22 @@ def packet_loss_test(acuClass, address=None,
 
     `address` defaults to the reboot-counter register, which is relocated on ABB
     families (54528) vs the others (38144)."""
-    if address is None:
-        address = reg.REBOOT_COUNTER_ABB if acuClass.is_abb() else reg.REBOOT_COUNTER
-    logger.info('{} ===== Data packet loss test ===== Modbus 115200, {} reads @ {:.0f} ms timeout, address {}'
-                .format(acuClass.serialNum, reads, timeout * 1000, address))
-
-    # 1) Channel 1 -> Modbus (written over the current 19200 line), then 2) reboot
-    #    so the protocol change applies before we talk Modbus at speed.
+    # 1) Channel 1 -> Modbus, then 2) reboot to apply. Do this FIRST so any read
+    #    (incl. model/family below) happens on a Modbus line. In the normal flow
+    #    S5 already restored channel 1 to Modbus over TCP, so this is a no-op
+    #    safety net for resume-at-S6 / standalone runs. (If channel 1 is stuck in
+    #    BACnet it can't be switched back over serial -- that recovery lives in S5.)
     syncConnectWrite(acuClass.BR, acuClass.COM, reg.PROTOCOL_CH1, [MODBUS_CH1])
     logger.info('{} channel 1 set to Modbus; rebooting to apply'.format(acuClass.serialNum))
     asyncio.run(reboot_meter(acuClass, boot_wait=90,
                              reason='apply Modbus on channel 1 for packet-loss test'))
+
+    # Meter now speaks Modbus @ 19200 -> pick the reboot-counter register (relocated
+    # on ABB). is_abb() reads the model; safe here and no longer crashes on failure.
+    if address is None:
+        address = reg.REBOOT_COUNTER_ABB if acuClass.is_abb() else reg.REBOOT_COUNTER
+    logger.info('{} ===== Data packet loss test ===== Modbus 115200, {} reads @ {:.0f} ms timeout, address {}'
+                .format(acuClass.serialNum, reads, timeout * 1000, address))
 
     # 3) Raise the line to 115200 (write at 19200, then talk at 115200).
     syncConnectWrite(acuClass.BR, acuClass.COM, reg.BAUD_CH1, [BAUD_CODE[STRESS_BAUD]])

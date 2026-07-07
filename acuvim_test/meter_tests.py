@@ -322,6 +322,13 @@ def meterModelScan(acuClass) -> str:
     RR = client.read_holding_registers(reg.MODEL, count=2, slave=1)
     sleep(1)
     client.close()
+    # Guard against a failed read: pymodbus returns a ModbusIOException/error
+    # object (no .registers) when the meter doesn't answer (e.g. wrong baud, or
+    # channel 1 not in Modbus mode). Don't crash -> report unknown family.
+    if RR is None or RR.isError() or not hasattr(RR, 'registers'):
+        logger.warning('{} could not read model register (comms/baud/protocol issue); family unknown'
+                       .format(acuClass.serialNum))
+        return None
     Model = ''
     for reading in RR.registers:
         ascii_hex = format(int(reading), '02X')

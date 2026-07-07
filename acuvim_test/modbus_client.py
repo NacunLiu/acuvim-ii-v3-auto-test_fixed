@@ -2,7 +2,7 @@
 import asyncio
 from time import sleep
 
-from pymodbus.client import ModbusSerialClient, AsyncModbusSerialClient
+from pymodbus.client import ModbusSerialClient, AsyncModbusSerialClient, ModbusTcpClient
 from pymodbus.transaction import ModbusRtuFramer
 from pymodbus.payload import BinaryPayloadBuilder
 from pymodbus.constants import Endian
@@ -30,7 +30,39 @@ def make_async_serial_client(port, baudrate):
                                    stopbits=1, bytesize=8, timeout=1, framer=ModbusRtuFramer)
 
 
-async def connect_with_retry(client, port, attempts=3, delay=2): 
+MODBUS_TCP_PORT = 502   # AXM-WEB2 / AXM-WEB-PUSH Modbus TCP gateway default port
+
+
+def tcp_set_registers(ip, writes, port=MODBUS_TCP_PORT, unit=1, timeout=3):
+    """Write config registers over Modbus TCP (via the Web module's gateway) and
+    verify the readback. `writes` is a list of (address, [values]).
+
+    This reaches the meter's register map over the internal bus, independently of
+    the RS485 channel-1 protocol -- so it works even when channel 1 is in BACnet
+    and can't be reached over serial. Config registers reject write-single (0x06,
+    IllegalFunction), so this uses write-multiple (0x10). Returns True on success.
+    """
+    client = ModbusTcpClient(ip, port=port, timeout=timeout)
+    if not client.connect():
+        logger.warning('Modbus TCP connect to {}:{} failed'.format(ip, port))
+        return False
+    try:
+        for addr, vals in writes:
+            wrr = client.write_registers(addr, list(vals), slave=unit)
+            if wrr is None or wrr.isError():
+                logger.warning('Modbus TCP write addr {} <- {} failed: {}'.format(addr, vals, wrr))
+                return False
+            rr = client.read_holding_registers(addr, count=len(vals), slave=unit)
+            if rr is None or rr.isError() or not hasattr(rr, 'registers') or rr.registers != list(vals):
+                logger.warning('Modbus TCP readback addr {} expected {} got {}'
+                               .format(addr, vals, getattr(rr, 'registers', rr)))
+                return False
+        return True
+    finally:
+        client.close()
+
+
+async def connect_with_retry(client, port, attempts=3, delay=2):
     """Open `client`, retrying if the COM port is briefly unavailable.
 
     On Windows the OS may not have released the serial handle yet from a prior
