@@ -1,5 +1,7 @@
 """Low-level Modbus access layer: client factories and register read/write."""
 import asyncio
+import atexit
+import weakref
 from time import sleep
 
 from pymodbus.client import ModbusSerialClient, AsyncModbusSerialClient, ModbusTcpClient
@@ -11,6 +13,34 @@ from acuvim_test import registers as reg
 from acuvim_test.log import logger
 
 
+# ---- Serial-port lifecycle safety net ---------------------------------------
+# Every serial client we create is tracked here so the COM port can be force
+# released on exit (normal, error, or Ctrl+C). On Windows an async serial client
+# left open keeps a background reader thread alive, which both blocks a clean
+# process exit AND leaves the port locked ('Access is denied') for the next run.
+# WeakSet so clients that close+GC on their own drop out on their own.
+_LIVE_SERIAL_CLIENTS = weakref.WeakSet()
+
+
+def _track(client):
+    _LIVE_SERIAL_CLIENTS.add(client)
+    return client
+
+
+def close_all_serial_clients():
+    """Close every serial client we created that's still open. Idempotent and
+    exception-safe -- call it from a finally block, an atexit hook, or a
+    KeyboardInterrupt handler to guarantee the COM port is released on exit."""
+    for client in list(_LIVE_SERIAL_CLIENTS):
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+atexit.register(close_all_serial_clients)
+
+
 # ---- Modbus client factories -------------------------------------------------
 # Single source of truth for the meter's RS485 line settings. If the pymodbus
 # API changes (e.g. a 3.13 migration), update only these two functions.
@@ -20,14 +50,14 @@ def make_serial_client(port, baudrate, timeout=1):
     timeout (seconds) is overridable for the packet-loss test, which uses a
     short per-request timeout (50 ms) to count unanswered requests.
     """
-    return ModbusSerialClient(method='rtu', port=port, baudrate=baudrate, parity='N',
-                              stopbits=1, bytesize=8, timeout=timeout, framer=ModbusRtuFramer)
+    return _track(ModbusSerialClient(method='rtu', port=port, baudrate=baudrate, parity='N',
+                                     stopbits=1, bytesize=8, timeout=timeout, framer=ModbusRtuFramer))
 
 
 def make_async_serial_client(port, baudrate):
     """Async Modbus-RTU client with the project's standard line settings."""
-    return AsyncModbusSerialClient(method='rtu', port=port, baudrate=baudrate, parity='N',
-                                   stopbits=1, bytesize=8, timeout=1, framer=ModbusRtuFramer)
+    return _track(AsyncModbusSerialClient(method='rtu', port=port, baudrate=baudrate, parity='N',
+                                          stopbits=1, bytesize=8, timeout=1, framer=ModbusRtuFramer))
 
 
 MODBUS_TCP_PORT = 502   # AXM-WEB2 / AXM-WEB-PUSH Modbus TCP gateway default port
@@ -110,12 +140,19 @@ def sync_connect_with_retry(client, port, attempts=3, delay=2):
 # synchronous connect and write through modbus rtu, allow changing protocol 1 from Modbus to Bacnet; NO NEED TO REBOOT
 def syncConnectWrite(old_baudrate, Port, Address, Value, promptEnable: bool = False):
     client = make_serial_client(Port, old_baudrate)
-    client.connect()
+    # Retry the open: rapid open/close cycles (e.g. the baud-rate sweep) can hit
+    # Windows' lingering-handle window ('Access is denied') on a plain connect().
+    if not sync_connect_with_retry(client, Port):
+        client.close()
+        raise RuntimeError('Could not open {} to write register {} (port busy / handle '
+                           'not yet released?)'.format(Port, Address))
     sleep(1)
     if (promptEnable):
         logger.info('Sync Connection Status: {}'.format(client.connected))
-    SyncModbusWriteRegisters(client, Address, Value)
-    client.close()
+    try:
+        SyncModbusWriteRegisters(client, Address, Value)
+    finally:
+        client.close()
     sleep(2)
 
 
@@ -142,7 +179,7 @@ async def asyncReadRegisters(client, Address: int, Size: int, Slave: int = 1):
 # Check if the custom register has default value of 0
 async def AsyncModbusCheckReadRegisters(acuClass, readAddress=reg.CUSTOM_REG_DEFAULT):
     client = make_async_serial_client(acuClass.COM, acuClass.BR)
-    await client.connect()
+    await connect_with_retry(client, acuClass.COM)
     await asyncio.sleep(1)
     RR = await asyncReadRegisters(client, readAddress, 1)
 
@@ -259,7 +296,7 @@ async def write_blocks(acuClass, blocks, reset=False):
 # return the serial number string
 async def AsyncReadSerialId(acuClass, slaveId):
     client = make_async_serial_client(acuClass.COM, acuClass.BR)
-    await client.connect()
+    await connect_with_retry(client, acuClass.COM)
     await asyncio.sleep(1)
     try:
         SR = await client.read_holding_registers(reg.SERIAL_NUMBER, 6, slaveId)

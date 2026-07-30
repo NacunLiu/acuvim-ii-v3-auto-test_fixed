@@ -217,7 +217,10 @@ def syncChangeBaudRate(acuClass):
         syncConnectWrite(curRate, acuClass.COM, reg.BAUD_CH1, [dict[rate]])
 
         client = make_serial_client(acuClass.COM, rate)
-        client.connect()
+        if not sync_connect_with_retry(client, acuClass.COM):
+            client.close()
+            raise RuntimeError('Could not open {} at {} baud for the baud-rate sweep '
+                               '(port busy / handle not yet released?)'.format(acuClass.COM, rate))
         sleep(5)
         rr = client.read_holding_registers(address=reg.BAUD_CH1, count=1, slave=1)
         sleep(2)
@@ -315,7 +318,7 @@ ABB_OLD_MODELS = {'CS06', 'CS26', 'CS46', 'CG06', 'CG26', 'CG46'}  # Acuvim IIX 
 def meterModelScan(acuClass) -> str:
     MeterFamily = defaultdict(list)
     MeterFamily['A'] = ['CU0', 'CP0', 'CP2', 'CP4', 'CU2', 'CV0', 'CM0']  # Accuenergy model
-    MeterFamily['E'] = ['CRD', 'CPG', 'CXD', 'CPD', 'CUG', 'CUD', 'CPE', 'CPH']  # Eaton model
+    MeterFamily['E'] = ['CRD', 'CPG', 'CXD', 'CPD', 'CUG', 'CUD', 'CPE', 'CPH', 'EPH']  # Eaton model (EPH = PXE / EPH4)
     MeterFamily['D'] = ['CPB', 'CUB'] # DEIF model
     client = make_serial_client(acuClass.COM, acuClass.BR)
     # Retry the open: right after the async serial-number read the OS may not have
@@ -343,6 +346,7 @@ def meterModelScan(acuClass) -> str:
         Model += hex_bytes.decode('ascii')
 
     logger.info('{} model code: {}'.format(acuClass.serialNum, Model))
+    acuClass.model_code = Model  # keep the raw code for the family prompt / diagnostics
     # ABB first (needs the full 4-char code; CS06 vs CS07 share the 'CS0' prefix).
     if Model[:4] in ABB_NEW_MODELS:
         return 'B_NEW'
@@ -351,6 +355,9 @@ def meterModelScan(acuClass) -> str:
     for key in MeterFamily:
         if (Model[:3] in MeterFamily[key]):
             return (key)
+    logger.warning('{} model code {!r} not in any known family list; family unknown'
+                   .format(acuClass.serialNum, Model))
+    return None
 
 
 # Purpose: async read energy values
@@ -475,7 +482,7 @@ async def energyLegitCheck(acuClass, Display, MeterModel):
     await asyncio.sleep(3)
 
     tests = list(ENERGY_TESTS_COMMON)
-    if MeterModel in 'ED':  # Eaton/DEIF don't support independent input-channel energy
+    if MeterModel in ('E', 'D'):  # Eaton/DEIF don't support independent input-channel energy
         logger.info('Meter model {}: independent energy tests skipped'.format(MeterModel))
     else:
         tests += ENERGY_TESTS_INDEPENDENT

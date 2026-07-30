@@ -10,7 +10,7 @@ from time import sleep
 from acuvim_test import registers as reg
 from acuvim_test.log import logger
 from acuvim_test.modbus_request import AccuenergyModbusRequest
-from acuvim_test.modbus_client import AsyncReadSerialId, tcp_set_registers
+from acuvim_test.modbus_client import AsyncReadSerialId, tcp_set_registers, close_all_serial_clients
 from acuvim_test.reboot import reboot_meter
 from acuvim_test.bacnet.ip_test import run_bacnet_ip_test
 from acuvim_test.bacnet.mstp_yabe import Client, SSIM_THRESHOLD
@@ -152,6 +152,7 @@ class TestRunner:
         self.static_ip = None  # set by caller: user-entered IP, or None => reuse DHCP address
         self.skip_energy = False  # set by caller: skip the S2 energy edit/retention test
         self.meter_family = None  # cached result of meterModelScan
+        self.model_code = None    # raw 4-char model code from the model register (for prompts)
 
     # Record a test failure: bump the count and keep the message for reporting.
     def fail(self, message):
@@ -166,6 +167,41 @@ class TestRunner:
 
     def is_abb(self):
         return self.family() in ('B_NEW', 'B_OLD')
+
+    def resolve_family(self, interactive=True):
+        """Determine the meter family ONCE, up front. Try auto-detect (model
+        register); if that fails or the model code isn't in the known lists, ask
+        the operator (interactive) so a new/unlisted model doesn't get mis-routed
+        to the wrong energy test (or crash on a None family). Sets self.meter_family."""
+        fam = meterModelScan(self)
+        if fam is not None:
+            self.meter_family = fam
+            logger.info('{} meter family auto-detected: {} (model {})'
+                        .format(self.serialNum, fam, self.model_code))
+            return fam
+        if interactive:
+            self.meter_family = self._prompt_meter_family()
+            logger.info('{} meter family set by operator: {}'
+                        .format(self.serialNum, self.meter_family))
+        else:
+            logger.warning('{} meter family unknown and no console to ask; energy routing '
+                           'may be wrong'.format(self.serialNum))
+        return self.meter_family
+
+    def _prompt_meter_family(self):
+        code = self.model_code
+        note = ' (model code read: {})'.format(code) if code else ' (model register unreadable)'
+        ans = _ask('Could not auto-detect the meter family{}. Which family is this meter?'.format(note),
+                   options=['A = Accuenergy',
+                            'E = Eaton (e.g. PXE / EPH4)',
+                            'D = DEIF',
+                            'N = ABB new  (M4M40, float64)',
+                            'O = ABB old  (Acuvim IIX Class S, float32)']).strip().upper()
+        fam = {'A': 'A', 'E': 'E', 'D': 'D', 'N': 'B_NEW', 'O': 'B_OLD'}.get(ans)
+        if fam is None:
+            logger.warning('unrecognized family choice {!r}; defaulting to Accuenergy (A)'.format(ans))
+            fam = 'A'
+        return fam
 
     # Mode-aware power control: use the Kasa plug when available, otherwise
     # just tell the operator (manual mode has no switch to drive).
@@ -382,8 +418,21 @@ class TestRunner:
                     break
             if completed_all:
                 save_progress(self.serialNum, len(SEGMENTS) - 1, 'done')
+        except KeyboardInterrupt:
+            # Ctrl+C mid-run: release the COM port before anything else so the
+            # next run isn't locked out ('Access is denied'), then re-raise.
+            logger.warning('{} interrupted by Ctrl+C; releasing serial port'.format(self.serialNum))
+            close_all_serial_clients()
+            raise
         finally:
-            asyncio.run(self.power_off())
+            # Always release the serial port (an interrupted segment leaves its
+            # client open; on Windows that keeps a reader thread alive and locks
+            # the port). Do this before power_off so the port frees promptly.
+            close_all_serial_clients()
+            try:
+                asyncio.run(self.power_off())
+            except Exception as e:
+                logger.warning('{} power_off during cleanup failed: {}'.format(self.serialNum, e))
         return self.failCount
 
 
@@ -593,6 +642,7 @@ def run_single_meter(config, use_switch, static_ip, skip_energy, browser_lock, y
     runner.read_serial()
     start_index, append_log = _resume_decision(runner)
     runner.open_log(append=append_log)
+    runner.resolve_family(interactive=True)  # detect or ask up front, so segments route correctly
     logger.info('pid {} testing meter {} (starting at segment {})'
                 .format(os.getpid(), runner.serialNum, start_index + 1))
     try:
@@ -613,6 +663,7 @@ def _run_meter_process(config, pnum, use_switch, skip_energy, shared_failCount, 
     runner.skip_energy = skip_energy
     runner.read_serial()
     runner.open_log(append=False)
+    runner.resolve_family(interactive=False)  # auto-detect only (no console in child)
     try:
         runner.run_meter(browser_lock, yabe_lock, start_index=0, interactive=False)
     finally:
