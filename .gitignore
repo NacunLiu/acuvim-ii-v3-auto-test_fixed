@@ -1,8 +1,10 @@
 __pycache__/
 *.csv
 *.ini
+!panel_config.ini.example
 *.log
 *.progress
+test_logs/report_png/
 scan_results.txt
 .dockerignore
 Dockerfile

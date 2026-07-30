@@ -1,0 +1,7 @@
+# R&D Panel credentials for acuvim_test.report (auto-upload of test results).
+# Copy this file to panel_config.ini and fill in YOUR panel login.
+# panel_config.ini is gitignored -- never commit real credentials.
+[panel]
+url = https://rd-panel.simonrd.ca
+email = your.name@accuenergy.com
+password = your-panel-password

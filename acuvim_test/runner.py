@@ -4,6 +4,7 @@ import sys
 import json
 import asyncio
 import logging
+import subprocess
 import multiprocessing
 from time import sleep
 
@@ -33,6 +34,20 @@ BACNET_LOCAL_ADDR = os.environ.get('ACU_BACNET_LOCAL', '0.0.0.0/24')
 
 # Directory where per-meter .log files are written (instead of the repo root).
 LOG_DIR = 'test_logs'
+
+
+# Purpose: make sure YABE is not running. YABE keeps the RS485 COM port open,
+# so a YABE left behind (especially after the manual-comparison flow) blocks
+# every later serial access with PermissionError 'Access is denied'.
+def _close_yabe():
+    try:
+        r = subprocess.run(['taskkill', '/f', '/im', 'Yabe.exe'],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            logger.info('YABE was still running; closed it to release the COM port')
+            sleep(2)  # give Windows a moment to release the serial handle
+    except Exception as e:
+        logger.warning('Could not check/close YABE: {}'.format(e))
 
 
 # Purpose: BACnet MS/TP test via YABE (relaxed screenshot smoke check).
@@ -204,18 +219,33 @@ class TestRunner:
         return fam
 
     # Mode-aware power control: use the Kasa plug when available, otherwise
-    # just tell the operator (manual mode has no switch to drive).
+    # just tell the operator (manual mode has no switch to drive). An unreachable
+    # plug must NOT kill the run (it used to raise straight out of run_meter):
+    # fall back to asking the operator, like manual mode.
     async def power_on(self):
         if self.use_switch:
-            await self.plug.powerOn(1)
-        else:
-            logger.info('Manual mode: please make sure the meter is powered ON')
+            try:
+                await self.plug.powerOn(1)
+                return
+            except Exception as e:
+                logger.warning('Kasa plug unreachable for power-on ({}); falling back to manual'
+                               .format(e))
+                try:
+                    input('Please make sure the meter is powered ON, then press Enter... ')
+                except (EOFError, RuntimeError):
+                    sleep(30)  # no console (child process): give the operator a moment
+                return
+        logger.info('Manual mode: please make sure the meter is powered ON')
 
     async def power_off(self):
         if self.use_switch:
-            await self.plug.powerOff()
-        else:
-            logger.info('Manual mode: tests done, you may power off the meter')
+            try:
+                await self.plug.powerOff()
+            except Exception as e:
+                logger.warning('Kasa plug unreachable for power-off ({}); please power off '
+                               'the meter by hand'.format(e))
+            return
+        logger.info('Manual mode: tests done, you may power off the meter')
 
     # ---- Setup ----------------------------------------------------------
     def read_serial(self):
@@ -305,6 +335,11 @@ class TestRunner:
         asyncio.run(meterMountTypeScan(self))  # channel 1 -> BACnet
         with self.yabe_lock:
             BACnetConnectionTest(self)  # MS/TP via YABE (relaxed)
+        # YABE holds the COM port while it's open. The automated flow clicks its
+        # close button, but the manual-comparison flow leaves the operator's YABE
+        # running -- which locks the serial port for everything after this
+        # ('Access is denied' in S6). Kill it explicitly.
+        _close_yabe()
         BACnetIpTest(self)  # BACnet/IP via bacpypes3 (deterministic)
         # meterMountTypeScan switched channel 1 to BACnet MS/TP, and that takes
         # effect immediately -- once the RS485 line is BACnet it can NOT be
@@ -364,6 +399,9 @@ class TestRunner:
     def seg_packet_loss(self):
         # Final test: Modbus @ 115200 packet-loss stress read, then restore the
         # meter to Modbus @ 19200 / channel-2 Web2.
+        # Safety net for resume-at-S6 / manual YABE sessions: YABE holds the COM
+        # port while open, which fails every serial open here with 'Access is denied'.
+        _close_yabe()
         run_packet_loss_and_restore(self)
 
     # ---- Segment driver -------------------------------------------------
@@ -648,7 +686,15 @@ def run_single_meter(config, use_switch, static_ip, skip_energy, browser_lock, y
     try:
         return runner.run_meter(browser_lock, yabe_lock, start_index=start_index, interactive=True)
     finally:
-        runner.close_log()
+        runner.close_log()  # flush/close the log BEFORE offering the panel upload
+        if runner.serialNum:
+            # Optional: push results + log screenshots to the R&D Panel checklist.
+            # Lazy import so a missing/broken report stack can never block testing.
+            try:
+                from acuvim_test.report import offer_upload
+                offer_upload(runner.serialNum, runner.meter_family)
+            except Exception as e:
+                logger.warning('Panel upload unavailable: {}'.format(e))
 
 
 def _run_meter_process(config, pnum, use_switch, skip_energy, shared_failCount, browser_lock, yabe_lock):
