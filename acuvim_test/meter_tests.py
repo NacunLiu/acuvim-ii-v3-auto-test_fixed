@@ -34,6 +34,14 @@ def openBrowser(acuClass, lock):
 
 # Purpose: Set up connection to meter through Modbus TCP, read IP through Modbus TCP and verify correctness
 async def AsyncModbusTCP(acuClass, Host):
+    # Guard: 0.0.0.0 means the Ethernet module never reported a real address
+    # (module still booting / no DHCP lease). Connecting to it raises WinError
+    # 1214, so record a clear failure instead.
+    if not Host or Host == '0.0.0.0':
+        logger.error('{} Modbus TCP test skipped: no valid meter IP (got {!r}; Ethernet '
+                     'module not booted or no address assigned)'.format(acuClass.serialNum, Host))
+        acuClass.fail('\nModbus TCP Test Fail (no valid meter IP)')
+        return
     logger.info('Modbus TCP Communication {} test in progress....'.format(Host))
     address = Host
     slaveId = await AsyncModbusCheckReadRegisters(acuClass, reg.SLAVE_ID)
@@ -67,23 +75,36 @@ async def AsyncModbusTCP(acuClass, Host):
 
 #########################################
 # purpose: store ip address of the meter
-async def asyncModbusCheckIp(acuClass, client):
-    rr = await asyncReadRegisters(client, reg.IP_ADDRESS, 2)
-    await asyncio.sleep(0.5)
-    ip = ''
-    try:
-        assert rr.registers
-        for reading in rr.registers:
-            ip_hex = format(int(reading), '02X')
-            if (reading > 255):
-                ip += str(int(ip_hex[:2], 16)) + '.' + str(int(ip_hex[2:], 16)) + '.'
-            else:
-                ip += str(int('0x00', 16)) + '.' + str(int(ip_hex, 16)) + '.'
-        acuClass.address = ip[:-1]
-        logger.info('{} ip address is: {}'.format(acuClass.serialNum, acuClass.address))
+async def asyncModbusCheckIp(acuClass, client, attempts=7, delay=15):
+    """Read the meter's IP register (259) and update acuClass.address.
 
-    except AttributeError:
-        logger.error('Bad Connection, read ip address failed')
+    The register is only populated once the Ethernet module finishes booting --
+    an AXM-WEB2 can take 2-3 minutes after a power cycle, well past the meter
+    itself answering Modbus. So retry while the read fails or returns 0.0.0.0,
+    and NEVER overwrite a previously learned address with 0.0.0.0 (a bogus
+    0.0.0.0 here used to propagate into the Modbus TCP test -> WinError 1214).
+    """
+    for attempt in range(1, attempts + 1):
+        rr = await asyncReadRegisters(client, reg.IP_ADDRESS, 2)
+        await asyncio.sleep(0.5)
+        try:
+            regs = rr.registers
+            ip = '{}.{}.{}.{}'.format(regs[0] >> 8, regs[0] & 0xFF,
+                                      regs[1] >> 8, regs[1] & 0xFF)
+        except (AttributeError, IndexError):
+            ip = None
+        if ip and ip != '0.0.0.0':
+            acuClass.address = ip
+            logger.info('{} ip address is: {}'.format(acuClass.serialNum, ip))
+            return
+        logger.warning('{} IP register not ready ({}); Ethernet module may still be '
+                       'booting -- attempt {}/{}, retrying in {}s'
+                       .format(acuClass.serialNum, ip or 'read failed', attempt, attempts, delay))
+        if attempt < attempts:
+            await asyncio.sleep(delay)
+    logger.error('{} could not learn a valid IP after {} attempts (module not booted / '
+                 'no address assigned); keeping previous address {}'
+                 .format(acuClass.serialNum, attempts, acuClass.address))
 
 
 #######################################################################
@@ -122,7 +143,9 @@ async def AsyncManualIpWrite(acuClass, Address=reg.IP_ADDRESS):
     logger.info('{} Static IP test: writing {}'.format(acuClass.serialNum, ip))
     await asyncConnectWrite(acuClass, reg.DHCP_ENABLE, [0], 'Disabling DHCP....')  # DHCP off
     await asyncConnectWrite(acuClass, Address, ip_to_registers(ip), 'Writing static IP {}'.format(ip))
-    await reboot_meter(acuClass, boot_wait=90, reason='apply manual IP / disable DHCP')
+    # 120s: the meter answers Modbus well before the Ethernet module (AXM-WEB2)
+    # finishes booting; the IP readback additionally retries while it reads 0.0.0.0.
+    await reboot_meter(acuClass, boot_wait=120, reason='apply manual IP / disable DHCP')
     await asyncConnectIp(acuClass)
 
 
@@ -420,24 +443,42 @@ def pingTest(acuClass, open_browser=False):
 
 
 ##########################################
+# The bench source keeps metering while we verify, so energy registers keep
+# accumulating between the write and the read-back -- with residual reactive
+# power, Eq_exp/Eq_net drift by a count or two (seen live: write 51702, read
+# 51701). Compare as 32-bit values with a small tolerance: genuine failures
+# (block wiped to 0, wrong value) are thousands of counts away.
+ENERGY_DRIFT_TOL = 3
+
+
+def _energy_mismatches(wrote, read, start_address=None, tol=ENERGY_DRIFT_TOL):
+    """Compare two register lists as uint32 pairs with +/-tol counts of slack.
+    Returns a list of mismatch descriptions (empty list = match)."""
+    if not isinstance(read, list) or len(read) != len(wrote):
+        return ['length/read error: wrote {} regs, read {!r}'.format(len(wrote), read)]
+    out = []
+    for i in range(0, len(wrote) - 1, 2):
+        w = (wrote[i] << 16) | wrote[i + 1]
+        r = (read[i] << 16) | read[i + 1]
+        if abs(r - w) > tol:
+            where = 'reg {}'.format(start_address + i) if start_address is not None else 'offset {}'.format(i)
+            out.append('{} wrote {} read {} (diff {})'.format(where, w, r, r - w))
+    if len(wrote) % 2 and wrote[-1] != read[-1]:
+        out.append('trailing reg wrote {} read {}'.format(wrote[-1], read[-1]))
+    return out
+
+
 # Compare energy readings with reference [contents]
 async def ReadingComparator(acuClass, contents, start_address, size):
     logger.info('{} reading back {} registers from address {} to verify write...'
                 .format(acuClass.serialNum, size, start_address))
     Energy = await checkEnergy(acuClass, start_address, size)
-    if Energy == contents:
-        logger.info('{} read-back MATCHES the written energy (address {})'
-                    .format(acuClass.serialNum, start_address))
+    mismatches = _energy_mismatches(contents, Energy, start_address)
+    if not mismatches:
+        logger.info('{} read-back MATCHES the written energy within +/-{} counts (address {})'
+                    .format(acuClass.serialNum, ENERGY_DRIFT_TOL, start_address))
         return True
-
-    # Report exactly which registers differ (address: wrote X, read Y).
-    mismatches = []
-    for i in range(min(len(contents), len(Energy))):
-        if Energy[i] != contents[i]:
-            mismatches.append('reg {} wrote {} read {}'.format(start_address + i, contents[i], Energy[i]))
-    if len(Energy) != len(contents):
-        mismatches.append('length wrote {} read {}'.format(len(contents), len(Energy)))
-    logger.error('{} read-back MISMATCH at address {} ({} reg(s) differ): {}'
+    logger.error('{} read-back MISMATCH at address {} ({} value(s) differ): {}'
                  .format(acuClass.serialNum, start_address, len(mismatches), '; '.join(mismatches[:20])))
     return False
 
@@ -445,8 +486,13 @@ async def ReadingComparator(acuClass, contents, start_address, size):
 # Energy edit/read sub-tests. Each is (label, start_address, contents). The
 # common set runs on every meter model; the "independent input channel" set
 # (was SequenceId 7/8) only runs on Accuenergy-family meters (not Eaton/DEIF).
-_MAX = [15258, 51711]   # max positive Ep/q/s sample
-_NEG = [50277, 13825]   # negative sample
+# Max writable energy = raw 999,999,990 (= Acuview 2's input cap of
+# 99,999,999.0 kWh at 0.1 resolution). Do NOT use raw 999,999,999: newer
+# firmware treats it as the rollover threshold and silently zeroes the write
+# (ACK but readback 0) on the Real Time Parameter energy blocks
+# (0x4048/0x4620/0x4900/0x4910). Verified on fw under test, meter AHB22070458.
+_MAX = [15258, 51702]   # +999,999,990  max positive Ep/q/s sample
+_NEG = [50277, 13834]   # -999,999,990  negative sample
 
 # Labels are "<region name> (<address>) - <pattern>" so logs say exactly which
 # energy block (and register address) each sub-test covers.
@@ -534,8 +580,17 @@ async def isMemorySectionEmpty(acuClass, StartAddress):
     await asyncio.sleep(1)
 
 
+# Expected read-back for AsyncManualEnergyWriteLegacy (16456 block + 18688 +
+# 17952 as checkEnergyLegacy concatenates them). Compared with drift tolerance.
+LEGACY_ENERGY_EXPECTED = [20, 31679, 0, 21347, 0, 20528, 1, 57872, 20, 53026, 20, 10332, 2, 12865, 21, 62748, 21,
+                          62748, 21, 62748, 7, 18954, 7, 21871, 7, 21992, 0, 0, 0, 0, 0, 0, 0, 0, 6, 47101, 0, 6775, 6,
+                          52223, 0, 12060,
+                          6, 63425, 0, 2511, 0, 3200, 0, 49436, 0, 11760, 0, 35876, 0, 5567, 0, 38094, 7, 18954, 7,
+                          21871, 7, 21922]
+
+
 # Energy memory retention test
-# Purpose: 
+# Purpose:
 async def EnergyMemoryRetention(acuClass, WaitControl):
     if (WaitControl):
         await asyncio.sleep(20)
@@ -543,30 +598,27 @@ async def EnergyMemoryRetention(acuClass, WaitControl):
         pass
     await AsyncManualEnergyWriteLegacy(acuClass)
     Energy = await checkEnergyLegacy(acuClass)
-    try:
-        assert Energy == [20, 31679, 0, 21347, 0, 20528, 1, 57872, 20, 53026, 20, 10332, 2, 12865, 21, 62748, 21,
-                          62748, 21, 62748, 7, 18954, 7, 21871, 7, 21992, 0, 0, 0, 0, 0, 0, 0, 0, 6, 47101, 0, 6775, 6,
-                          52223, 0, 12060,
-                          6, 63425, 0, 2511, 0, 3200, 0, 49436, 0, 11760, 0, 35876, 0, 5567, 0, 38094, 7, 18954, 7,
-                          21871, 7, 21922]
-        print(f'After reboot, read the energy result is : {Energy}')
-
-    except AssertionError:
+    mismatches = _energy_mismatches(LEGACY_ENERGY_EXPECTED, Energy)
+    if mismatches:
         acuClass.failCount += 1
         acuClass.failTest.append('\nEnergy memory retention test 1 fails')
-        logger.error('{} Energy memory retention test 1 has failed {}'.format(acuClass.serialNum, Energy))
-        
+        logger.error('{} Energy memory retention test 1 has failed: {}'
+                     .format(acuClass.serialNum, '; '.join(mismatches[:10])))
+    else:
+        logger.info('{} retention test 1: written energy verified (within +/-{} counts)'
+                    .format(acuClass.serialNum, ENERGY_DRIFT_TOL))
 
     await reboot_meter(acuClass, store_wait=130, reason='energy memory retention')
     await asyncio.sleep(30)
     Energy = await checkEnergyLegacy(acuClass)
-    try:
-        assert Energy == [20, 31679, 0, 21347, 0, 20528, 1, 57872, 20, 53026, 20, 10332, 2, \
-                          12865, 21, 62748, 21, 62748, 21, 62748, 7, 18954, 7, 21871,
-                          7, 21992, 0, 0, 0, 0, 0, 0, 0, 0, 6, 47101, 0, 6775, 6, 52223, 0, 12060, \
-                          6, 63425, 0, 2511, 0, 3200, 0, 49436, 0, 11760, 0, 35876,
-                          0, 5567, 0, 38094, 7, 18954, 7, 21871, 7, 21922]
-    except AssertionError:
+    # After ~4 min of store+reboot the live source drifts the reactive counters
+    # a little further -- allow a bigger (still tiny) budget for the power-cycle leg.
+    mismatches = _energy_mismatches(LEGACY_ENERGY_EXPECTED, Energy, tol=ENERGY_DRIFT_TOL * 3)
+    if mismatches:
         acuClass.failCount += 1
         acuClass.failTest.append('\nEnergy memory retention test 2 fails')
-        logger.error('{} Energy memory retention test 1 has failed {}'.format(acuClass.serialNum, Energy))
+        logger.error('{} Energy memory retention test 2 has failed: {}'
+                     .format(acuClass.serialNum, '; '.join(mismatches[:10])))
+    else:
+        logger.info('{} retention test 2: energy survived the power cycle (within +/-{} counts)'
+                    .format(acuClass.serialNum, ENERGY_DRIFT_TOL * 3))

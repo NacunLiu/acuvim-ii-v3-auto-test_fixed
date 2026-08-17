@@ -465,12 +465,12 @@ class TestRunner:
         finally:
             # Always release the serial port (an interrupted segment leaves its
             # client open; on Windows that keeps a reader thread alive and locks
-            # the port). Do this before power_off so the port frees promptly.
+            # the port).
             close_all_serial_clients()
-            try:
-                asyncio.run(self.power_off())
-            except Exception as e:
-                logger.warning('{} power_off during cleanup failed: {}'.format(self.serialNum, e))
+            # Deliberately do NOT power off the Kasa switch here: the operator
+            # usually keeps working with the meter after a run (panel uploads,
+            # manual checks, re-runs), so leave it powered.
+            logger.info('{} test run finished; meter left powered ON'.format(self.serialNum))
         return self.failCount
 
 
