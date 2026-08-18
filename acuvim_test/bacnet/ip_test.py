@@ -88,6 +88,46 @@ async def run_bacnet_ip_test(target_ip, local_addr, device_instance=None, timeou
         app.close()
 
 
+async def read_bacnet_analog_values(target_ip, local_addr, device_instance=None,
+                                    timeout=5, max_objects=120):
+    """Read every analog object's name + present-value from the meter.
+
+    Used to verify BACnet real-time readings against a known source output.
+    Returns (values: dict[str, float], detail: str). An empty dict means the
+    objects could not be read (detail says why).
+    """
+    app = _build_app(local_addr)
+    values = {}
+    try:
+        addr = Address(target_ip)
+        if device_instance is not None:
+            i_ams = await app.who_is(device_instance, device_instance, addr, timeout)
+        else:
+            i_ams = await app.who_is(address=addr, timeout=timeout)
+        if not i_ams:
+            return {}, 'No I-Am received from {}'.format(target_ip)
+        dev_id = i_ams[0].iAmDeviceIdentifier
+
+        obj_list = await app.read_property(addr, dev_id, 'object-list')
+        analog = [o for o in obj_list
+                  if str(o[0]).startswith('analog')][:max_objects]
+        if not analog:
+            return {}, 'device exposes no analog objects'
+
+        for obj in analog:
+            try:
+                name = await app.read_property(addr, obj, 'object-name')
+                val = await app.read_property(addr, obj, 'present-value')
+                values[str(name)] = float(val)
+            except Exception as e:      # keep going: one bad object shouldn't kill the sweep
+                logger.debug('BACnet read {} failed: {}'.format(obj, e))
+        return values, '{} analog object(s) read'.format(len(values))
+    except Exception as e:
+        return {}, 'BACnet/IP error: {}'.format(e)
+    finally:
+        app.close()
+
+
 if __name__ == '__main__':
     import sys
     logging.basicConfig(level=logging.INFO)

@@ -25,6 +25,7 @@ from acuvim_test.meter_tests import (
 )
 from acuvim_test.abb_energy import abb_energy_check
 from acuvim_test.packet_loss import run_packet_loss_and_restore
+from acuvim_test.source_verify import source_reading_verification
 
 
 # Local NIC address (with CIDR) used by the BACnet/IP client. Override via env
@@ -341,6 +342,10 @@ class TestRunner:
         # ('Access is denied' in S6). Kill it explicitly.
         _close_yabe()
         BACnetIpTest(self)  # BACnet/IP via bacpypes3 (deterministic)
+        # Drive the CL3021 source to a known point and verify the meter reports
+        # it over BACnet/IP (cross-checked over Modbus TCP). Skips itself with a
+        # log note when no source is controllable.
+        source_reading_verification(self, BACNET_LOCAL_ADDR)
         # meterMountTypeScan switched channel 1 to BACnet MS/TP, and that takes
         # effect immediately -- once the RS485 line is BACnet it can NOT be
         # switched back over serial. The next segment (S6 packet loss) is

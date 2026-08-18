@@ -51,6 +51,18 @@ def energy_label(address, extra=''):
     base = '{} ({})'.format(ENERGY_REGION_NAMES.get(address, 'Energy region'), address)
     return '{} - {}'.format(base, extra) if extra else base
 
+# Live real-time metering, float32 big-endian, 2 registers per value.
+# Verified against a CL3021 source (57.7 V / 1 A / 50 Hz -> 57.706 / 1.0003 / 50.001):
+REALTIME_FLOAT = 16384      # 0x4000, block start
+RT_FREQ = 16384             # frequency (Hz)
+RT_U_PHASE = 16386          # Ua, Ub, Uc (V)  -- 3 floats
+RT_U_AVG = 16392            # U LN average (V)
+RT_U_LINE = 16394           # Uab, Ubc, Uca (V) -- 3 floats
+RT_U_LINE_AVG = 16400       # U LL average (V)
+RT_I_PHASE = 16402          # Ia, Ib, Ic (A)  -- 3 floats
+RT_I_AVG = 16408            # I average (A)
+RT_P_TOTAL = 16418          # total active power (W)
+
 # Diagnostics / identity
 CUSTOM_REG_DEFAULT = 27136  # custom register, default 0
 REBOOT_COUNTER = 38144      # reboot counter (Accuenergy / Eaton / DEIF), 0x9500

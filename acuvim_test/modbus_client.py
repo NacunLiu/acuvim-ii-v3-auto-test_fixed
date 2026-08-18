@@ -1,6 +1,7 @@
 """Low-level Modbus access layer: client factories and register read/write."""
 import asyncio
 import atexit
+import struct
 import weakref
 from time import sleep
 
@@ -88,6 +89,29 @@ def tcp_set_registers(ip, writes, port=MODBUS_TCP_PORT, unit=1, timeout=3):
                                .format(addr, vals, getattr(rr, 'registers', rr)))
                 return False
         return True
+    finally:
+        client.close()
+
+
+def tcp_read_floats(ip, address, count, port=MODBUS_TCP_PORT, unit=1, timeout=3):
+    """Read `count` big-endian float32 values (2 registers each) over Modbus TCP.
+
+    Used to cross-check live metering while channel 1 is in BACnet (serial is
+    unusable then, but the Web module's TCP gateway still reaches the registers).
+    Returns a list of floats, or None on failure.
+    """
+    client = ModbusTcpClient(ip, port=port, timeout=timeout)
+    if not client.connect():
+        logger.warning('Modbus TCP connect to {}:{} failed'.format(ip, port))
+        return None
+    try:
+        rr = client.read_holding_registers(address, count=count * 2, slave=unit)
+        regs = getattr(rr, 'registers', None)
+        if regs is None or len(regs) < count * 2:
+            logger.warning('Modbus TCP float read @{} failed: {}'.format(address, rr))
+            return None
+        return [struct.unpack('>f', struct.pack('>HH', regs[i], regs[i + 1]))[0]
+                for i in range(0, count * 2, 2)]
     finally:
         client.close()
 
