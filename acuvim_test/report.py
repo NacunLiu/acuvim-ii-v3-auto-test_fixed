@@ -120,7 +120,10 @@ RULES = {
     'Profibus Mode': [('S5', ['Profibus', 'protocol 2'])],
     'Profibus Default ID': [('S5', ['Profibus', 'protocol 2'])],
     'Channel 1 BACnet ID 4': [('S5', ['BACnet id: 4', 'non-display meter'])],
-    'BACnet Connection': [('S5', ['BACnet MS/TP', 'BACnet/IP'])],
+    # MS/TP is logged in S5 (Web Push fitted) while BACnet/IP is logged in S3
+    # (Web2 fitted), so collect this item's evidence from the whole log rather
+    # than one segment -- keeps the panel template unchanged.
+    'BACnet Connection': [('ALL', ['BACnet MS/TP', 'BACnet/IP', 'readings match the source'])],
     'Failure Notification': [('ALL', ['Test finished'])],
     'Packet Loss Stress Test': [('S6', ['packet loss', 'Data packet loss'])],
 }

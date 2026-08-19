@@ -322,6 +322,20 @@ class TestRunner:
         logger.info('Modbus TCP to {} test in progress'.format(self.address))
         asyncio.run(AsyncModbusTCP(self, self.address))
 
+        # BACnet/IP lives here, not in the Web Push phase: BACnet/IP is served by
+        # the AXM-WEB2 module, which is the module installed for this segment.
+        # AXM-WEB-PUSH (fitted later, for S5) has a Modbus TCP gateway but no
+        # BACnet/IP server, so testing it there could only ever fail. Doing it now
+        # also means the operator swaps the module once instead of back and forth.
+        if self.is_abb():
+            logger.info('{} BACnet/IP SKIPPED: ABB (CS0/CS2) meters support Modbus only'
+                        .format(self.serialNum))
+        else:
+            BACnetIpTest(self)
+            # Drive the CL3021 source to a known point and verify the meter
+            # reports it over BACnet/IP (cross-checked over Modbus TCP).
+            source_reading_verification(self, BACNET_LOCAL_ADDR)
+
     def seg_reboot_counter(self):
         AccuenergyModbusRequest(self.COM, self.BR, is_abb=self.is_abb()).rebootCounter(self)
 
@@ -341,11 +355,13 @@ class TestRunner:
         # running -- which locks the serial port for everything after this
         # ('Access is denied' in S6). Kill it explicitly.
         _close_yabe()
-        BACnetIpTest(self)  # BACnet/IP via bacpypes3 (deterministic)
-        # Drive the CL3021 source to a known point and verify the meter reports
-        # it over BACnet/IP (cross-checked over Modbus TCP). Skips itself with a
-        # log note when no source is controllable.
-        source_reading_verification(self, BACNET_LOCAL_ADDR)
+        # BACnet/IP is NOT tested here: this phase runs with AXM-WEB-PUSH fitted,
+        # which serves Modbus TCP but no BACnet/IP. It was covered in S3 while
+        # AXM-WEB2 was installed. MS/TP above is unaffected -- it runs over RS485,
+        # independently of whichever Ethernet module is fitted.
+        logger.info('{} BACnet/IP not tested in this phase (AXM-WEB-PUSH has no '
+                    'BACnet/IP server); it was covered in S3 with AXM-WEB2'
+                    .format(self.serialNum))
         # meterMountTypeScan switched channel 1 to BACnet MS/TP, and that takes
         # effect immediately -- once the RS485 line is BACnet it can NOT be
         # switched back over serial. The next segment (S6 packet loss) is
