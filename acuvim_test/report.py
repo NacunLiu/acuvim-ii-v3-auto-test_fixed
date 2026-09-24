@@ -46,7 +46,8 @@ PNG_DIR = os.path.join(LOG_DIR, 'report_png')
 
 # A line containing any of these marks its item as Fail.
 FAIL_MARKERS = ['ERROR', 'FAILED', 'FAIL TO', 'Alert!', 'MISMATCH', 'Timed Out',
-                'has failed', 'Test Failed', 'could not read', 'could not open']
+                'has failed', 'Test Failed', 'could not read', 'could not open',
+                'testing meter None']
 
 # Log slices, cut on the runner's segment markers ('===== START <name> =====').
 SEG_KEYS = {
@@ -129,6 +130,10 @@ RULES = {
 }
 
 # Items that are N/A (not Fail) when the log shows independents were skipped.
+# Evidence that only says a step was SKIPPED means the step did not apply to
+# this meter (e.g. ABB families are Modbus-only) -- that is N/A, not a Pass.
+NA_MARKERS = ['SKIPPED', 'skipped by user']
+
 NA_WHEN_INDEP_SKIPPED = {'Independent Energy Not Supported', 'Independent Max Energy',
                          'Independent Min Energy', 'Channel Max Energy', 'Channel Min Energy'}
 
@@ -152,6 +157,8 @@ def collect_evidence(slices, level5, occurrence):
             return skip, 'N/A'
     if not lines:
         return None, None
+    if all(any(m in ln for m in NA_MARKERS) for ln in lines):
+        return lines[:60], 'N/A'
     lines = lines[:60]  # keep screenshots readable
     status = 'Fail' if any(m in ln for ln in lines for m in FAIL_MARKERS) else 'Pass'
     return lines, status
@@ -282,7 +289,8 @@ def pick_run(panel):
     return runs[max(0, min(idx, len(runs) - 1))]['id']
 
 
-def upload_for_meter(serial=None, family=None, run_id=None, dry_run=False, assume_yes=False):
+def upload_for_meter(serial=None, family=None, run_id=None, dry_run=False,
+                     assume_yes=False, na_missing=False):
     """Main flow. Returns the number of items updated."""
     log_path = pick_log(serial)
     sn = os.path.splitext(os.path.basename(log_path))[0]
@@ -310,7 +318,10 @@ def upload_for_meter(serial=None, family=None, run_id=None, dry_run=False, assum
         raise SystemExit('Run {} has no "{}" items'.format(run_id, checklist))
 
     # Build the plan: one entry per checklist item that has evidence in the log.
-    plan, seen = [], {}
+    # Items with no evidence are left untouched by default; with na_missing
+    # they are explicitly marked N/A (the step did not apply to this meter --
+    # e.g. ABB families skip BACnet, or the operator skipped the energy test).
+    plan, na_plan, seen = [], [], {}
     for t in items:
         name = t.get('level5') or t.get('item_text', '')
         occ = seen.get(name, 0)
@@ -318,6 +329,8 @@ def upload_for_meter(serial=None, family=None, run_id=None, dry_run=False, assum
         lines, status = collect_evidence(slices, name, occ)
         if lines:
             plan.append((t, name, occ, lines, status))
+        elif na_missing:
+            na_plan.append((t, name, occ))
 
     print('\nRun [{}] {} -> {}'.format(run_id, run.get('name'), checklist), flush=True)
     print('{} of {} checklist items have log evidence for meter {}:'.format(
@@ -325,10 +338,16 @@ def upload_for_meter(serial=None, family=None, run_id=None, dry_run=False, assum
     for t, name, occ, lines, status in plan:
         print('  {:<34} {:>4}  ({} line(s))'.format(
             name + (' #%d' % (occ + 1) if seen[name] > 1 else ''), status, len(lines)), flush=True)
+    if na_plan:
+        print('')
+        print('{} item(s) with no evidence -> will be set N/A:'.format(len(na_plan)), flush=True)
+        for t, name, occ in na_plan:
+            print('  {:<34} {:>4}'.format(
+                name + (' #%d' % (occ + 1) if seen[name] > 1 else ''), 'N/A'), flush=True)
     if dry_run:
         print('\nDRY RUN: rendering PNGs only, no upload / no status change.', flush=True)
     elif not assume_yes:
-        if _ask('Upload these {} results?'.format(len(plan)),
+        if _ask('Upload {} result(s) + set {} N/A?'.format(len(plan), len(na_plan)),
                 options=['Y = upload', 'N = cancel']).upper() not in ('Y', 'YES'):
             print('Cancelled.', flush=True)
             return 0
@@ -349,6 +368,22 @@ def upload_for_meter(serial=None, family=None, run_id=None, dry_run=False, assum
             done += 1
         except Exception as e:
             logger.error('panel: {} upload failed: {}'.format(name, e))
+    na_done = 0
+    for t, name, occ in na_plan:
+        if dry_run:
+            na_done += 1
+            continue
+        try:
+            panel.set_result(run_id, t['id'], 'N/A',
+                             'No corresponding step in the automated run for this '
+                             'meter ({}.log) -- not applicable.'.format(sn))
+            logger.info('panel: {} -> N/A (no evidence)'.format(name))
+            na_done += 1
+        except Exception as ex:
+            logger.error('panel: {} N/A write failed: {}'.format(name, ex))
+    if na_plan:
+        print('{}{} of {} item(s) set to N/A.'.format('DRY RUN: ' if dry_run else '',
+                                                      na_done, len(na_plan)), flush=True)
     print('\n{}{} of {} items {}.'.format('DRY RUN: ' if dry_run else '', done, len(plan),
                                           'rendered' if dry_run else 'uploaded'), flush=True)
     return done
@@ -377,9 +412,12 @@ def main():
     ap.add_argument('--run', type=int, help='panel run id (default: pick from list)')
     ap.add_argument('--dry-run', action='store_true', help='render PNGs only, no uploads')
     ap.add_argument('--yes', action='store_true', help='skip the confirmation prompt')
+    ap.add_argument('--na-missing', action='store_true',
+                    help='mark checklist items with no log evidence as N/A '
+                         '(default: leave them untouched)')
     a = ap.parse_args()
     upload_for_meter(serial=a.serial, family=a.family, run_id=a.run,
-                     dry_run=a.dry_run, assume_yes=a.yes)
+                     dry_run=a.dry_run, assume_yes=a.yes, na_missing=a.na_missing)
 
 
 if __name__ == '__main__':
