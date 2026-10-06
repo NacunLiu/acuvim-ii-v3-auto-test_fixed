@@ -14,3 +14,6 @@ test.py
 !Sc/Reference.png
 Sc/*
 
+jira_token.txt
+*.jsonl
+test_logs/*.png
