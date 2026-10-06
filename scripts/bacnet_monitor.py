@@ -19,13 +19,35 @@ from datetime import datetime
 
 ROUTER_IP = '20.20.20.34'
 DNET = 203
+# The JACE itself. It does not answer Who-Is, but it does answer a directed
+# ReadProperty -- which is the one check that catches the failure we actually
+# hit: its BACnet/IP port left disabled, so the meters are fine on the wire but
+# the station sees none of them.
+JACE_IP = '20.20.20.25'
+JACE_INSTANCE = 1001
 EXPECTED = list(range(2, 11))          # device instances 2..10
-BACNET_PORT = 47808
+BACNET_PORT = 47808          # where we send; see _socket() for where we listen
 LISTEN_SECS = 12
 ROUNDS = 3
 
 LOG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    'test_logs', 'bacnet_monitor.jsonl')
+
+
+def _socket():
+    """A UDP socket on an ephemeral port, not on 47808.
+
+    Everything here is request/response and BACnet replies go back to the source
+    port, so there is no need to own 47808 -- and owning it is actively harmful:
+    YABE or Acuview binds it too, and with SO_REUSEADDR Windows hands each reply
+    to only one of the sockets. Sharing the port made the monitor report every
+    meter offline the moment YABE was opened.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    s.bind(('0.0.0.0', 0))
+    s.settimeout(0.8)
+    return s
 
 
 def _parse_iam(d):
@@ -58,17 +80,72 @@ def _parse_iam(d):
     return struct.unpack('>I', a[3:7])[0] & 0x3FFFFF, snet, sadr
 
 
+_SYSTEM_STATUS = {0: 'operational', 1: 'operational-read-only',
+                  2: 'download-required', 3: 'download-in-progress',
+                  4: 'non-operational', 5: 'backup-in-progress'}
+
+
+def jace_status(timeout=5):
+    """ReadProperty system-status from the JACE's device object.
+
+    Returns one of the BACnet system-status names, 'unreachable' when it does
+    not answer (its BACnet/IP port is disabled or the station is down), or
+    'error' when it answers with an Error-PDU.
+    """
+    objid = (8 << 22) | JACE_INSTANCE                 # object type 8 = device
+    apdu = bytes([0x00, 0x05, 0x01, 0x0C, 0x0C]) + struct.pack('>I', objid)         + bytes([0x19, 112])                          # property 112 = system-status
+    body = bytes([0x01, 0x04]) + apdu
+    pkt = bytes([0x81, 0x0a]) + struct.pack('>H', len(body) + 4) + body
+
+    s = _socket()
+    try:
+        s.sendto(pkt, (JACE_IP, BACNET_PORT))
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            try:
+                d, a = s.recvfrom(1500)
+            except socket.timeout:
+                continue
+            if a[0] != JACE_IP or len(d) < 8:
+                continue
+            ctl = d[5]
+            p = 6
+            if ctl & 0x08:
+                p += 2
+                p += 1 + d[p]
+            if ctl & 0x20:
+                p += 2
+                p += 1 + d[p]
+                p += 1
+            ap = d[p:]
+            if len(ap) < 2 or ap[1] != 0x01:
+                continue
+            if ap[0] >> 4 == 5:
+                return 'error'
+            if ap[0] >> 4 == 3:
+                # ctx0 objid, ctx1 propid, then opening tag 3 + an enumerated
+                q = 3
+                if ap[q] == 0x0C:
+                    q += 5
+                if ap[q] & 0xF8 == 0x18:
+                    q += 1 + (ap[q] & 0x07)
+                if ap[q] != 0x3E:
+                    return 'unparsed'
+                tag = ap[q + 1]
+                val = int.from_bytes(ap[q + 2:q + 2 + (tag & 0x07)], 'big')
+                return _SYSTEM_STATUS.get(val, 'status-{}'.format(val))
+        return 'unreachable'
+    finally:
+        s.close()
+
+
 def sweep():
     """Who-Is to DNET, unicast to the router. Returns {instance: mstp_mac}."""
     npdu = bytes([0x01, 0x24]) + struct.pack('>H', DNET) + bytes([0x00, 0xFF])
     body = npdu + bytes([0x10, 0x08])          # unconstrained Who-Is
     pkt = bytes([0x81, 0x0a]) + struct.pack('>H', len(body) + 4) + body
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    s.bind(('0.0.0.0', BACNET_PORT))
-    s.settimeout(0.8)
+    s = _socket()
     found = {}
     try:
         for _ in range(ROUNDS):
@@ -103,6 +180,7 @@ def previous():
 
 def main():
     prev = previous()
+    jace = jace_status()
     found = sweep()
     online = sorted(found)
     offline = [i for i in EXPECTED if i not in found]
@@ -112,6 +190,7 @@ def main():
         'ts': datetime.now().astimezone().isoformat(timespec='seconds'),
         'router': ROUTER_IP,
         'dnet': DNET,
+        'jace': jace,
         'expected': EXPECTED,
         'online': online,
         'offline': offline,
@@ -126,8 +205,8 @@ def main():
     with open(LOG, 'a', encoding='utf-8') as fh:
         fh.write(json.dumps(record) + '\n')
 
-    print('{}  online {}/{}  offline={}  {}'.format(
-        record['ts'], len(online), len(EXPECTED),
+    print('{}  JACE={}  online {}/{}  offline={}  {}'.format(
+        record['ts'], jace, len(online), len(EXPECTED),
         offline or 'none',
         'changed: -{} +{}'.format(record.get('went_offline') or [],
                                   record.get('came_online') or [])
