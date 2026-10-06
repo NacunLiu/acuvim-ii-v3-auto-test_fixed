@@ -15,7 +15,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from acuvim_test.report import render_png            # noqa: E402  same look as panel evidence
-from scripts.bacnet_monitor import LOG, EXPECTED, ROUTER_IP, DNET   # noqa: E402
+from scripts.bacnet_monitor import LOG, EXPECTED_MACS, ROUTER_IP, DNET   # noqa: E402
 
 
 def records(limit=None):
@@ -32,27 +32,30 @@ def build_lines(samples):
         return ['no samples in {}'.format(LOG)]
     last = rows[-1]
     online = set(last['online'])
-    macs = last.get('macs', {})
+    inst = last.get('instances', {})
 
     out = [
         'Router : KMC BAC-5051E  {}   (BACnet MS/TP network {})'.format(ROUTER_IP, DNET),
         'Probe  : Who-Is addressed to DNET {}, unicast to the router'.format(DNET),
         'Sample : {}'.format(last['ts']),
         '',
-        '  Device    MS/TP MAC   Status',
-        '  --------  ---------   ------',
+        '  MS/TP MAC   Device ID   Status',
+        '  ---------   ---------   ------',
     ]
-    for inst in EXPECTED:
-        out.append('  {:<8}  {:<9}   {}'.format(
-            inst, macs.get(str(inst), '-'), 'OK' if inst in online else 'OFFLINE'))
-    out += ['', '  {} of {} meters responding.'.format(len(online & set(EXPECTED)), len(EXPECTED))]
+    for mac in EXPECTED_MACS:
+        out.append('  {:<9}   {:<9}   {}'.format(
+            mac, inst.get(str(mac), '-'), 'OK' if mac in online else 'OFFLINE'))
+    out += ['', '  {} of {} meters responding.'.format(
+        len(online & set(EXPECTED_MACS)), len(EXPECTED_MACS))]
 
     recent = records(samples)
     if len(recent) > 1:
         out += ['', 'Recent samples:']
         for r in recent:
-            out.append('  {}   online {}/{}   offline {}'.format(
-                r['ts'], len(r['online']), len(r['expected']), r['offline'] or 'none'))
+            out.append('  {}   JACE {:<12}  online {}/{}   offline {}'.format(
+                r['ts'], r.get('jace', '-'), len(r['online']),
+                len(r.get('expected_macs') or r.get('expected', [])),
+                r['offline'] or 'none'))
     return out
 
 

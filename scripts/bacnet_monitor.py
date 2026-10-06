@@ -25,7 +25,11 @@ DNET = 203
 # the station sees none of them.
 JACE_IP = '20.20.20.25'
 JACE_INSTANCE = 1001
-EXPECTED = list(range(2, 11))          # device instances 2..10
+# Track the meters by their MS/TP MAC, not by device instance: the MAC is the
+# physical position on the trunk and does not move, while the instances have
+# already been renumbered once (2-10 -> 1002-1010) to clear a collision with
+# two foreign devices on the IP side.
+EXPECTED_MACS = list(range(2, 11))
 BACNET_PORT = 47808          # where we send; see _socket() for where we listen
 LISTEN_SECS = 12
 ROUNDS = 3
@@ -140,7 +144,7 @@ def jace_status(timeout=5):
 
 
 def sweep():
-    """Who-Is to DNET, unicast to the router. Returns {instance: mstp_mac}."""
+    """Who-Is to DNET, unicast to the router. Returns {mstp_mac: instance}."""
     npdu = bytes([0x01, 0x24]) + struct.pack('>H', DNET) + bytes([0x00, 0xFF])
     body = npdu + bytes([0x10, 0x08])          # unconstrained Who-Is
     pkt = bytes([0x81, 0x0a]) + struct.pack('>H', len(body) + 4) + body
@@ -157,15 +161,15 @@ def sweep():
                 except socket.timeout:
                     continue
                 r = _parse_iam(d)
-                if r and r[1] == DNET:
-                    found[r[0]] = int(r[2], 16) if r[2] else None
+                if r and r[1] == DNET and r[2]:
+                    found[int(r[2], 16)] = r[0]
     finally:
         s.close()
     return found
 
 
 def previous():
-    """Last recorded online set, for transition detection."""
+    """Last recorded set of online MACs, for transition detection."""
     try:
         with open(LOG, encoding='utf-8') as fh:
             last = None
@@ -173,7 +177,11 @@ def previous():
                 line = line.strip()
                 if line:
                     last = line
-        return set(json.loads(last)['online']) if last else None
+        if not last:
+            return None
+        rec = json.loads(last)
+        # Records written before the switch to MAC tracking keyed on instance.
+        return set(rec['online']) if 'expected_macs' in rec else None
     except (OSError, ValueError, KeyError):
         return None
 
@@ -183,19 +191,19 @@ def main():
     jace = jace_status()
     found = sweep()
     online = sorted(found)
-    offline = [i for i in EXPECTED if i not in found]
-    extra = [i for i in online if i not in EXPECTED]
+    offline = [m for m in EXPECTED_MACS if m not in found]
+    extra = [m for m in online if m not in EXPECTED_MACS]
 
     record = {
         'ts': datetime.now().astimezone().isoformat(timespec='seconds'),
         'router': ROUTER_IP,
         'dnet': DNET,
         'jace': jace,
-        'expected': EXPECTED,
+        'expected_macs': EXPECTED_MACS,
         'online': online,
         'offline': offline,
         'unexpected': extra,
-        'macs': {str(k): v for k, v in sorted(found.items())},
+        'instances': {str(k): v for k, v in sorted(found.items())},
     }
     if prev is not None:
         record['went_offline'] = sorted(prev - set(online))
@@ -205,8 +213,8 @@ def main():
     with open(LOG, 'a', encoding='utf-8') as fh:
         fh.write(json.dumps(record) + '\n')
 
-    print('{}  JACE={}  online {}/{}  offline={}  {}'.format(
-        record['ts'], jace, len(online), len(EXPECTED),
+    print('{}  JACE={}  online {}/{}  offline MAC={}  {}'.format(
+        record['ts'], jace, len(online), len(EXPECTED_MACS),
         offline or 'none',
         'changed: -{} +{}'.format(record.get('went_offline') or [],
                                   record.get('came_online') or [])
